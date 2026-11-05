@@ -7,7 +7,7 @@ import os, sys, json, base64, uuid, math, random, hashlib
 from pathlib import Path
 
 from PySide6.QtGui import QCursor
-from PySide6.QtCore import QPoint, Qt, QRectF, QPointF, QSizeF, QUrl, QBuffer, QIODevice, QSettings, QSize, QTimer, QVariantAnimation, QEasingCurve, QStandardPaths
+from PySide6.QtCore import QEventLoop, QElapsedTimer, QPoint, Qt, QRectF, QPointF, QSizeF, QUrl, QBuffer, QIODevice, QSettings, QSize, QTimer, QVariantAnimation, QEasingCurve, QStandardPaths
 from PySide6.QtGui import (QColor, QPainter, QPen, QPixmap, QImage, QKeySequence,
                            QAction, QFont, QPolygonF, QLinearGradient, QBrush, QImageReader, QTransform, QIcon,
                            QPainterPath, QPalette, QTextCursor, QTextBlockFormat, QTextCharFormat, QRadialGradient, QPainterPathStroker, QFontMetricsF)
@@ -6388,6 +6388,285 @@ class Main(QMainWindow):
                                                   f"({fmt}, no quality loss) to:\n{folder}")
 
 
+# ---------------------------------------------------------------- splash screen
+class SplashScreen(QWidget):
+    """Animated launch screen: phone swipe -> web view -> 'Aero.' wordmark, with a progress bar.
+    Drawn entirely in code (no network, no image files). Click or press a key to skip."""
+    W, H, M = 520, 320, 30            # panel size and shadow margin
+    TOTAL, HOLD, FADE = 4.2, 0.4, 0.25
+    PHONE_END, WEB_END = 1.6, 3.0
+
+    def __init__(self, version=""):
+        super().__init__(None, Qt.SplashScreen | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setFixedSize(self.W + 2 * self.M, self.H + 2 * self.M)
+        self.version = version
+        self.force_t = None
+        self.skipped = False
+        self.clock = None
+        self.loop = None
+        self.timer = QTimer(self)
+        self.timer.setInterval(16)
+        self.timer.timeout.connect(self.tick)
+        self.pics = [self.make_pic(i, 160, 240) for i in range(2)]
+        self.wide = [self.make_pic(i + 2, 240, 160) for i in range(2)]
+        scr = QApplication.primaryScreen()
+        if scr:
+            g = scr.availableGeometry()
+            self.move(g.center().x() - self.width() // 2, g.center().y() - self.height() // 2)
+
+    @staticmethod
+    def make_pic(k, w, h):
+        """Soft gradient 'photo' placeholder (sky, sun, hills)."""
+        pal = [("#7dd3fc", "#fbcfe8", "#312e81"), ("#fde68a", "#fb923c", "#7c2d12"),
+               ("#a5b4fc", "#67e8f9", "#134e4a"), ("#fecdd3", "#c4b5fd", "#1e1b4b")][k % 4]
+        pm = QPixmap(w, h)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing)
+        g = QLinearGradient(0, 0, 0, h)
+        g.setColorAt(0, QColor(pal[0]))
+        g.setColorAt(1, QColor(pal[1]))
+        p.fillRect(pm.rect(), g)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(255, 255, 255, 170))
+        p.drawEllipse(QPointF(w * 0.68, h * 0.30), w * 0.11, w * 0.11)
+        for j, a in enumerate((120, 200)):
+            c = QColor(pal[2]); c.setAlpha(a)
+            path = QPainterPath()
+            path.moveTo(0, h)
+            path.lineTo(0, h * (0.70 + 0.04 * j))
+            path.cubicTo(w * 0.3, h * (0.52 + 0.1 * j), w * 0.6, h * (0.82 - 0.06 * j), w, h * (0.62 + 0.08 * j))
+            path.lineTo(w, h)
+            p.fillPath(path, c)
+        p.end()
+        return pm
+
+    # ---- timing
+    def t(self):
+        if self.force_t is not None:
+            return self.force_t
+        return self.clock.elapsed() / 1000.0 if self.clock else 0.0
+
+    def run(self):
+        """Show the animation and block (event loop running) until it finishes or is skipped."""
+        self.clock = QElapsedTimer()
+        self.clock.start()
+        self.timer.start()
+        self.loop = QEventLoop()
+        self.loop.exec()
+        self.timer.stop()
+
+    def tick(self):
+        self.update()
+        if self.skipped or self.t() >= self.TOTAL + self.HOLD + self.FADE:
+            if self.loop:
+                self.loop.quit()
+
+    def mousePressEvent(self, e):
+        self.skipped = True
+
+    def keyPressEvent(self, e):
+        self.skipped = True
+
+    # ---- drawing helpers
+    @staticmethod
+    def ease(x):
+        x = max(0.0, min(1.0, x))
+        return 1 - (1 - x) ** 4
+
+    def paintEvent(self, ev):
+        t = self.t()
+        p = QPainter(self)
+        p.setRenderHints(QPainter.Antialiasing | QPainter.TextAntialiasing | QPainter.SmoothPixmapTransform)
+        fade = 1.0 - max(0.0, (t - self.TOTAL - self.HOLD) / self.FADE)
+        p.setOpacity(max(0.0, min(1.0, fade)))
+        M, W, H = self.M, self.W, self.H
+        panel = QRectF(M, M, W, H)
+        # soft shadow
+        for i in range(14):
+            r = panel.adjusted(-i * 1.6, -i * 1.6 + 8, i * 1.6, i * 1.6 + 8)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(0, 0, 0, 9))
+            p.drawRoundedRect(r, 16 + i * 1.6, 16 + i * 1.6)
+        clip = QPainterPath()
+        clip.addRoundedRect(panel, 16, 16)
+        p.save()
+        p.setClipPath(clip)
+        bg = QLinearGradient(panel.topLeft(), panel.bottomRight())
+        bg.setColorAt(0, QColor("#0a0d18")); bg.setColorAt(0.5, QColor("#10142a")); bg.setColorAt(1, QColor("#1a1d44"))
+        p.fillRect(panel, bg)
+        for c, col, a in ((panel.topLeft(), QColor(56, 189, 248), 55), (panel.bottomRight(), QColor(129, 140, 248), 45)):
+            rg = QRadialGradient(c, 230)
+            col.setAlpha(a); rg.setColorAt(0, col)
+            col.setAlpha(0); rg.setColorAt(1, col)
+            p.fillRect(panel, rg)
+        self.draw_header(p, panel, t)
+        content = QRectF(panel.left() + 24, panel.top() + 50, W - 48, H - 50 - 24 - 4 - 8 - 18 - 8)
+        if t < self.PHONE_END:
+            self.draw_phone(p, content, t)
+        elif t < self.WEB_END:
+            self.draw_web(p, content, t - self.PHONE_END)
+        else:
+            self.draw_wordmark(p, content, t - self.WEB_END)
+        self.draw_progress(p, panel, t)
+        p.restore()
+        p.setPen(QPen(QColor(255, 255, 255, 28), 1))
+        p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(panel.adjusted(0.5, 0.5, -0.5, -0.5), 16, 16)
+        p.end()
+
+    def draw_header(self, p, panel, t):
+        x, y = panel.left() + 24, panel.top() + 24
+        p.setPen(Qt.NoPen)
+        pulse = 0.55 + 0.45 * math.sin(t * 5)
+        p.setBrush(QColor(34, 211, 238, int(210 * pulse)))
+        p.drawEllipse(QPointF(x + 5, y + 6), 4.5, 4.5)
+        f = QFont("Segoe UI", 8); f.setBold(True); f.setLetterSpacing(QFont.AbsoluteSpacing, 1.6)
+        p.setFont(f)
+        p.setPen(QColor(226, 232, 240, 100))
+        p.drawText(QPointF(x + 18, y + 10), "LAUNCHING APPLICATION")
+        f2 = QFont("Consolas", 8)
+        p.setFont(f2)
+        p.drawText(QRectF(panel.right() - 24 - 160, y - 2, 160, 18), Qt.AlignRight | Qt.AlignVCenter, self.version)
+
+    def marquee(self, p, rect, pics, iw, ih, gap, t, radius):
+        """Pictures sliding left -> right, seamless loop."""
+        period = 2 * (iw + gap)
+        off = ((t % 3.5) / 3.5) * period - period
+        p.save()
+        p.setClipRect(rect)
+        y = rect.center().y() - ih / 2
+        for k in range(-1, int(rect.width() / (iw + gap)) + 3):
+            x = rect.left() + off + k * (iw + gap)
+            pm = pics[k % 2]
+            path = QPainterPath()
+            r = QRectF(x, y, iw, ih)
+            path.addRoundedRect(r, radius, radius)
+            p.save()
+            p.setClipPath(path, Qt.IntersectClip)
+            p.drawPixmap(r, pm, QRectF(pm.rect()))
+            p.restore()
+            p.setPen(QPen(QColor(255, 255, 255, 28), 1))
+            p.setBrush(Qt.NoBrush)
+            p.drawRoundedRect(r, radius, radius)
+        p.restore()
+
+    def draw_phone(self, p, c, t):
+        e = self.ease(t / 0.8)
+        pw, ph = 130.0, 188.0
+        cx, cy = c.center().x(), c.center().y()
+        p.save()
+        p.setOpacity(p.opacity() * e)
+        p.translate(cx, cy + 120 * (1 - e))
+        p.rotate(-10 * (1 - e))
+        p.translate(-pw / 2, -ph / 2)
+        p.setPen(QPen(QColor(255, 255, 255, 50), 1))
+        p.setBrush(QColor("#1e293b"))
+        p.drawRoundedRect(QRectF(-12, 56, 22, 36), 10, 10)                      # thumb
+        for i in range(3):
+            p.drawRoundedRect(QRectF(pw - 10, 36 + i * 32, 22, 26), 10, 10)      # fingers
+        body = QRectF(0, 0, pw, ph)
+        p.setPen(QPen(QColor(51, 65, 85, 205), 2))
+        p.setBrush(QColor("#0f172a"))
+        p.drawRoundedRect(body, 26, 26)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor("#020617"))
+        p.drawRoundedRect(QRectF(pw / 2 - 18, 9, 36, 7), 3.5, 3.5)               # notch
+        screen = QRectF(8, 24, pw - 16, ph - 32)
+        path = QPainterPath()
+        path.addRoundedRect(screen, 16, 16)
+        p.fillPath(path, QColor("#020617"))
+        p.save()
+        p.setClipPath(path, Qt.IntersectClip)
+        self.marquee(p, screen, self.pics, 86, 130, 12, t, 8)
+        p.restore()
+        p.restore()
+
+    def draw_web(self, p, c, t):
+        a = self.ease(t / 0.35)
+        p.save()
+        p.setOpacity(p.opacity() * a)
+        box = QRectF(c.left(), c.center().y() - 78, c.width(), 156)
+        path = QPainterPath()
+        path.addRoundedRect(box, 12, 12)
+        p.fillPath(path, QColor(15, 23, 42, 230))
+        p.save()
+        p.setClipPath(path, Qt.IntersectClip)
+        bar = QRectF(box.left(), box.top(), box.width(), 28)
+        p.fillRect(bar, QColor("#1e293b"))
+        for i, col in enumerate(("#ef4444", "#eab308", "#22c55e")):
+            cc = QColor(col); cc.setAlpha(205)
+            p.setPen(Qt.NoPen); p.setBrush(cc)
+            p.drawEllipse(QPointF(bar.left() + 16 + i * 15, bar.center().y()), 4.5, 4.5)
+        pill = QRectF(bar.left() + 70, bar.top() + 5, bar.width() - 86, 18)
+        p.setBrush(QColor(2, 6, 23, 155))
+        p.drawRoundedRect(pill, 6, 6)
+        p.setFont(QFont("Consolas", 8))
+        p.setPen(QColor(148, 163, 184))
+        p.drawText(pill, Qt.AlignCenter, "Aero  -  Carousel Preview")
+        gal = QRectF(box.left(), bar.bottom(), box.width(), box.height() - bar.height())
+        self.marquee(p, gal, self.wide, 120, 80, 12, t, 8)
+        p.restore()
+        p.setPen(QPen(QColor(255, 255, 255, 28), 1))
+        p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(box, 12, 12)
+        p.restore()
+
+    def draw_wordmark(self, p, c, t):
+        f = QFont("Segoe UI", 1)
+        f.setPixelSize(78)
+        f.setWeight(QFont.ExtraBold)
+        f.setLetterSpacing(QFont.AbsoluteSpacing, -1.5)
+        thin = QFont(f)
+        thin.setWeight(QFont.Medium)
+        letters = [("A", f), ("e", f), ("r", f), ("o", f), (".", thin)]
+        adv = [QFontMetricsF(fo).horizontalAdvance(ch) for ch, fo in letters]
+        total = sum(adv) + 2
+        x = c.center().x() - total / 2
+        base = c.center().y() + 26
+        for i, (ch, fo) in enumerate(letters):
+            e = self.ease((t - (0.1 + 0.15 * i)) / 0.85)
+            if e > 0:
+                path = QPainterPath()
+                path.addText(0, 0, fo, ch)
+                br = path.boundingRect()
+                p.save()
+                p.setOpacity(p.opacity() * e)
+                p.translate(x + adv[i] / 2 - 60 * (1 - e), base)
+                p.scale(0.92 + 0.08 * e, 0.92 + 0.08 * e)
+                p.translate(-adv[i] / 2, 0)
+                if ch == ".":
+                    p.fillPath(path, QColor("#22d3ee"))
+                else:
+                    g = QLinearGradient(0, -56, 0, 0)
+                    g.setColorAt(0, QColor("#ffffff")); g.setColorAt(1, QColor("#cbd5e1"))
+                    p.fillPath(path, g)
+                p.restore()
+            x += adv[i] + (2 if ch == "o" else 0)
+
+    def draw_progress(self, p, panel, t):
+        x, w = panel.left() + 24, panel.width() - 48
+        y = panel.bottom() - 24 - 4
+        frac = max(0.0, min(1.0, t / self.TOTAL))
+        sm = frac * frac * (3 - 2 * frac)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(30, 41, 59, 205))
+        p.drawRoundedRect(QRectF(x, y, w, 4), 2, 2)
+        if sm > 0:
+            g = QLinearGradient(x, 0, x + w, 0)
+            g.setColorAt(0, QColor("#06b6d4")); g.setColorAt(0.5, QColor("#38bdf8")); g.setColorAt(1, QColor("#6366f1"))
+            p.setBrush(g)
+            p.drawRoundedRect(QRectF(x, y, w * sm, 4), 2, 2)
+        status = ("Preparing tools and filters" if t < self.PHONE_END else
+                  "Get ready to unleash your inner creativity" if t < self.WEB_END else "Launching Aero...")
+        p.setFont(QFont("Segoe UI", 9))
+        p.setPen(QColor(148, 163, 184))
+        p.drawText(QRectF(x, y - 24, w - 60, 18), Qt.AlignLeft | Qt.AlignVCenter, status)
+        p.setFont(QFont("Consolas", 9))
+        p.setPen(QColor(34, 211, 238, 230))
+        p.drawText(QRectF(x + w - 60, y - 24, 60, 18), Qt.AlignRight | Qt.AlignVCenter, f"{int(frac * 100)}%")
+
+
 def resource_path(*parts):
     """Bundled data files: next to the script, or inside the PyInstaller bundle when packaged."""
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
@@ -6415,7 +6694,15 @@ if __name__ == "__main__":
     app.setApplicationVersion(APP_BUILD)
     app.setWindowIcon(app_icon())      # every window / dialog inherits it
     apply_theme(app)
+    splash = None
+    if not os.environ.get("AERO_NO_SPLASH"):
+        splash = SplashScreen(APP_BUILD)
+        splash.show()
+        app.processEvents()
     w = Main()
+    if splash:
+        splash.run()
+        splash.close()
     start = StartScreen(w)
     if start.exec() != QDialog.Accepted:
         sys.exit(0)

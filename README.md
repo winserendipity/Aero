@@ -1,3 +1,8 @@
+[README.md](https://github.com/user-attachments/files/34525308/README.md)
+<p align="center">
+  <img src="assets/aero_icon_256.png" alt="Aero logo" width="140">
+</p>
+
 <h1 align="center">Aero</h1>
 
 <p align="center">
@@ -23,7 +28,8 @@
 2. [Purpose](#purpose)
 3. [Platform and compatibility](#platform-and-compatibility)
 4. [Built with](#built-with)
-5. [How Aero helps photographers and creators](#how-aero-helps-photographers-and-creators)
+5. [System requirements](#system-requirements)
+6. [How Aero helps photographers and creators](#how-aero-helps-photographers-and-creators)
 6. [Features](#features)
 7. [Getting started](#getting-started)
 8. [Documentation](#documentation)
@@ -65,6 +71,29 @@ Aero is built and tested for Windows 11 desktop. It does not need a GPU or an in
 - **Interface:** [PySide6](https://doc.qt.io/qtforpython/) (Qt for Python), with a custom dark and light theme
 - **Image processing:** [NumPy](https://numpy.org/) and [Pillow](https://python-pillow.org/), with `pillow-heif` for HEIC/HEIF
 - **Distribution:** packaged as a standalone Windows installer
+
+---
+
+## System requirements
+
+| | Minimum | Recommended |
+| --- | --- | --- |
+| **OS** | Windows 11, 64-bit | Windows 11, 64-bit (latest updates) |
+| **Processor** | 4 cores, 3.0 GHz (Intel Core i5-8400 / AMD Ryzen 5 2600 or better) | 8+ cores (Intel Core i7-12700 / AMD Ryzen 7 5800X or better) |
+| **Memory** | 8 GB RAM | 16 GB RAM (32 GB for 4x image exports) |
+| **Graphics** | Any GPU with OpenGL 3.3 / DirectX 11 (for example Intel UHD 620) and up-to-date drivers | Dedicated GPU with 4 GB+ VRAM (NVIDIA GTX 1650 / RTX 3050, AMD RX 6600 or better) |
+| **Storage** | 1 GB for the app, plus 2 GB free for exports (HDD works) | SSD, with 20 GB+ free for video exports |
+| **Sound card** | Not required | Any Windows audio device (only needed to listen to exported videos) |
+| **Display** | 1920 x 1080 | 1920 x 1080 or higher |
+
+**Additional notes**
+
+- These figures are estimates from the app's design, not formal benchmarks. Real speed depends on photo size, number of layers and filters.
+- **GPU drawing** is on by default and can be switched off in **File > Settings > General**. If a graphics problem is detected at startup, Aero turns it off automatically.
+- Photo filters, video filters and exporting use the **processor** (several cores). The GPU makes panning, zooming and dragging smoother.
+- Video export is near-lossless, so files are large and rendering takes time. Plan free disk space accordingly. Video slides are exported at up to 2x (for example 2160 x 2700 px), even when images use a higher resolution, which keeps the encoder to roughly 1 GB of memory.
+- Some videos (HEVC / H.265) may need the Microsoft "HEVC Video Extensions" from the Microsoft Store.
+- No internet connection is needed to use Aero.
 
 ---
 
@@ -173,19 +202,27 @@ More than **230 looks**, searchable and grouped by category:
 - **Smart guides and snapping** that can be turned on or off, plus a toggle for guides.
 - **Undo / Redo** (up to 100 steps).
 
-### Video (optional)
+### Video
 
-- Add **video layers** to a carousel and play / pause them in the editor.
-- **Export MP4**: one video per slide with your design composited in.
+- **Add Video** (next to **Add Image**, in the toolbar and the Insert menu) puts a video layer on the canvas; it plays in the editor.
+- Right-click a video for **Crop Video**, **Trim Video Length**, **Edit Video (Filters)** and **Play / Pause**.
+- **Crop Video:** crop on the spot with the same box, snapping and panel as photos.
+- **Trim Video Length:** keep only the part of the clip you want, with start and end sliders.
+- **Edit Video (Filters):** every Edit Image option works on video: all 230+ filters and film looks, plus exposure, contrast, colour, grain and more.
+- **Export:** one Export command saves everything. Slides that contain video are exported as MP4 (full quality, original frame rate and sound; a video can run across several slides), and the other slides as images. All files are numbered in slide order.
 
 ### Export: quality first
 
 The **Export** dialog is built around keeping every detail:
 
 - **Formats:** PNG (lossless), JPEG (maximum quality), JFIF (maximum quality), TIFF (lossless), WebP (lossless), HEIC (maximum quality), HEIF (maximum quality) and BMP (uncompressed).
-- **Resolution:** **Best detail** (automatic 2× to 4×) or a fixed 1× to 4×.
+- **Resolution:** **Best detail** (automatic 2× to 4×; HEIC / HEIF stop at 2× because they are very memory-hungry) or a fixed 1× to 4×. Slides with video are always limited to 2× (larger video needs many GB of memory and plays on almost no device).
+- **Video encoder:** *Best quality - processor* (default, near-lossless H.264) or *Much faster - graphics card* (NVIDIA NVENC, high quality, hardly any processor use). If the graphics card cannot do it, Aero switches to the processor automatically.
+- **Speed:** video filters are computed on several threads at once (a few frames ahead), and the encoder is tuned for speed, so filtered videos export several times faster than before.
+- **Progress bar:** one progress window for the whole export, with the current slide, overall percentage and time left. You can cancel at any time.
+- **Computer load:** *Balanced* (default) uses about half of your CPU cores at lower priority so the PC stays usable; *Gentle* uses 2 cores; *Fast* uses everything. Aero also checks free memory first and offers a lower resolution if the export would not fit.
 - Text, shapes and grid photos are rendered at the export resolution, so fonts stay crisp.
-- Each slide is saved as its own numbered file (`slide_01`, `slide_02`, ...) in the folder you choose.
+- Each slide is saved as its own numbered file (`slide_01`, `slide_02`, ...) in the folder you choose. Slides with video become `.mp4` files in the same folder.
 - Transparent areas are kept in PNG, TIFF and WebP.
 
 ### Projects and files
@@ -301,4 +338,4 @@ Aero is **in beta (0.0.1)**. Current focus:
 
 Created by **Winserendipity**.
 
-© 2026 Winserendipity. **All rights reserved.** Aero is distributed as a compiled Windows application for beta testing. The source code is open and to collaborate with others please ask for permission first.
+© 2026 Winserendipity. **All rights reserved.** Aero is distributed as a compiled Windows application for beta testing. The source code is not public and may not be copied, redistributed or modified without the author's permission.

@@ -1,8 +1,3 @@
-
-<p align="center">
-  <img src="assets/aero_icon_256.png" alt="Aero logo" width="140">
-</p>
-
 <h1 align="center">Aero</h1>
 
 <p align="center">

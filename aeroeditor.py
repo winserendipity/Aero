@@ -3,11 +3,12 @@ Aero (beta) - a seamless carousel editor for Instagram / Facebook albums, for de
 Run:  pip install PySide6 numpy   then   python aeroeditor.py
 Optional: pip install rembg (AI background removal), pillow pillow-heif (iPhone HEIC photos).
 """
-import os, sys, json, base64, uuid, math, random, hashlib
+import os, sys, json, base64, uuid, math, random, hashlib, time, shutil, subprocess, tempfile, threading, weakref, atexit, queue, gc
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from PySide6.QtGui import QCursor
-from PySide6.QtCore import QEventLoop, QElapsedTimer, QPoint, Qt, QRectF, QPointF, QSizeF, QUrl, QBuffer, QIODevice, QSettings, QSize, QTimer, QVariantAnimation, QEasingCurve, QStandardPaths
+from PySide6.QtCore import QThread, QObject, Signal, Slot, QEventLoop, QElapsedTimer, QPoint, Qt, QRectF, QPointF, QSizeF, QUrl, QBuffer, QIODevice, QSettings, QSize, QTimer, QVariantAnimation, QEasingCurve, QStandardPaths
 from PySide6.QtGui import (QColor, QPainter, QPen, QPixmap, QImage, QKeySequence,
                            QAction, QFont, QPolygonF, QLinearGradient, QBrush, QImageReader, QTransform, QIcon,
                            QPainterPath, QPalette, QTextCursor, QTextBlockFormat, QTextCharFormat, QRadialGradient, QPainterPathStroker, QFontMetricsF)
@@ -15,7 +16,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QGraphicsScene, QGraphicsView, QGraphicsPixmapItem,
     QGraphicsTextItem, QToolBar, QFileDialog, QColorDialog, QFontDialog, QSpinBox,
     QGraphicsItem, QInputDialog, QProgressDialog, QDialog, QTabWidget, QGridLayout, QPushButton,
-    QListWidget, QListWidgetItem, QAbstractItemView, QDialogButtonBox, QFormLayout, QComboBox, QLabel, QSlider, QWidget, QVBoxLayout, QDockWidget, QMessageBox, QScrollArea, QToolButton, QMenu,
+    QListWidget, QListWidgetItem, QAbstractItemView, QDialogButtonBox, QFormLayout, QComboBox, QLabel, QSlider, QDoubleSpinBox, QWidget, QVBoxLayout, QDockWidget, QMessageBox, QScrollArea, QToolButton, QMenu,
     QStyleOptionGraphicsItem, QCheckBox, QGraphicsDropShadowEffect, QHBoxLayout, QLineEdit, QRadioButton, QStackedWidget, QFrame,
 )
 
@@ -25,11 +26,10 @@ except ImportError:
     np = None
 
 try:
-    from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
-    from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
-    HAS_VIDEO = True
+    import cv2
 except ImportError:
-    HAS_VIDEO = False
+    cv2 = None
+HAS_VIDEO = cv2 is not None and np is not None      # video is decoded with OpenCV (the same decoder the export uses)
 
 PRESETS = {
     "1080 x 1350 (4:5)": (1080, 1350),
@@ -453,36 +453,396 @@ class ShapeItem(QGraphicsItem):
             sc.on_shape_edit()
 
 
+def frame_pixmap(img, crop, adj, maxdim=None):
+    """One video frame -> picture after crop + Edit Image settings (filters / adjustments)."""
+    W, H = img.width(), img.height()
+    if crop:
+        x0, y0 = int(crop[0] * W), int(crop[1] * H)
+        img = img.copy(x0, y0, max(1, int(crop[2] * W) - x0), max(1, int(crop[3] * H) - y0))
+    if maxdim and max(img.width(), img.height()) > maxdim:
+        img = img.scaled(maxdim, maxdim, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+    if adj and np is not None:
+        rgb, alpha = qimage_to_np(img)
+        return np_to_pixmap(adjust_rgb(rgb, adj), alpha)
+    return QPixmap.fromImage(img)
+
+
+_WORKERS = weakref.WeakSet()
+
+
+def stop_all_video_workers():
+    for w in list(_WORKERS):
+        try:
+            w.shutdown()
+        except Exception:
+            pass
+
+
+atexit.register(stop_all_video_workers)
+
+_WATCH = []          # (worker, weak reference to its video layer): strong refs keep a thread alive until it is stopped
+_SWEEP = {"timer": None}
+
+
+def _sweep_workers():
+    """Stop the thread of any video layer that no longer exists (deleted, undone, scene cleared)."""
+    for entry in list(_WATCH):
+        w, ref = entry
+        it = ref()
+        try:
+            gone = it is None or (it.scene() is None and it.was_in_scene)
+        except RuntimeError:
+            gone = True
+        if gone:
+            w.shutdown()
+            _WATCH.remove(entry)
+
+
+def watch_worker(worker, item):
+    _WATCH.append((worker, weakref.ref(item)))
+    if _SWEEP["timer"] is None and QApplication.instance() is not None:
+        t = QTimer(QApplication.instance())
+        t.setInterval(1000)
+        t.timeout.connect(_sweep_workers)
+        t.start()
+        _SWEEP["timer"] = t
+
 if HAS_VIDEO:
-    class VideoItem(QGraphicsVideoItem):
-        """Muted, looping video layer (preview in editor)."""
-        def __init__(self, path, size=None, fit_w=864):
+    class VideoWorker(QThread):
+        """Decodes, crops, filters and paces one video on its own thread, so the editor never waits for a frame.
+        The window only receives finished pictures (queued signal) - no decoding or filtering happens on the GUI thread."""
+        ready = Signal(object, int, int, int, int)  # picture, position ms, native width, native height, sequence number
+        failed = Signal(str)
+
+        def __init__(self, path):
+            super().__init__()
+            self.path = path
+            self.crop, self.adj, self.trim = None, {}, None
+            self.playing, self.seek_to, self.redo, self.stop_flag = True, None, False, False
+            self.dur_ms, self.fps, self.pos_ms, self.W, self.H = 0, 30.0, 0, 0, 0
+            self.raw = None                      # last decoded full-size frame (BGR)
+            self.wake = threading.Event()
+            self.fails = 0
+            self.lim = 512                       # preview size while playing with filters: adapts to the PC's speed
+            self.avg = 0.0                       # average time to filter one frame
+            self.seq, self.inflight = 0, 0
+            self.lock = threading.Lock()
+            self.pool = None
+            self.settle = False
+            self.pool_n = max(1, min(4, (os.cpu_count() or 2) // 2))
+            _WORKERS.add(self)
+
+        def shutdown(self):
+            self.stop_flag = True
+            self.wake.set()
+            if self.isRunning() and QThread.currentThread() is not self:
+                self.wait(1500)
+
+        def poke(self, **kw):
+            for k, v in kw.items():
+                setattr(self, k, v)
+            if kw.get("playing") is False:
+                self.settle = True
+            self.wake.set()
+
+        def frame_range(self):
+            if self.trim:
+                a = int(self.trim[0] / 1000.0 * self.fps)
+                b = int(self.trim[1] / 1000.0 * self.fps)
+            else:
+                a, b = 0, self.n
+            a = min(max(a, 0), max(self.n - 1, 0))
+            return a, min(max(b, a + 1), self.n)
+
+        def make_picture(self, fr, lim=None):
+            crop, adj = self.crop, self.adj
+            H, W = fr.shape[:2]
+            if crop:
+                x0, y0 = int(crop[0] * W), int(crop[1] * H)
+                fr = fr[y0:max(y0 + 1, int(crop[3] * H)), x0:max(x0 + 1, int(crop[2] * W))]
+            lim = lim or (int(self.lim) if adj else 1280)
+            h, w = fr.shape[:2]
+            if max(h, w) > lim:
+                k = lim / max(h, w)
+                fr = cv2.resize(fr, (max(1, int(w * k)), max(1, int(h * k))), interpolation=cv2.INTER_AREA)
+            rgb = cv2.cvtColor(fr, cv2.COLOR_BGR2RGB)
+            if adj:
+                try:
+                    rgb = (np.clip(adjust_rgb(rgb.astype(np.float32) / 255.0, adj), 0, 1) * 255 + 0.5).astype(np.uint8)
+                    self.fails = 0
+                except Exception as e:           # never let a filter take the app down
+                    self.fails += 1
+                    if self.fails >= 3:
+                        self.adj = {}
+                        self.failed.emit(f"This filter could not be applied to the video preview ({e}). Preview shown without it.")
+            rgb = np.ascontiguousarray(rgb)
+            h, w = rgb.shape[:2]
+            return QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888).copy()
+
+        def emit_frame(self, fr, idx, sharp=False):
+            """Still frame (seek / paused / settings changed): done right here at high quality."""
+            self.raw = fr
+            self.pos_ms = int(idx / self.fps * 1000)
+            self.seq += 1
+            self.ready.emit(self.make_picture(fr, 1280 if sharp else None), self.pos_ms, self.W, self.H, self.seq)
+
+        def submit_frame(self, fr, idx):
+            """Playing: filter the frame on a pool thread so decoding keeps its pace; the preview size adapts."""
+            self.raw = fr
+            pos = int(idx / self.fps * 1000)
+            self.pos_ms = pos
+            if not self.adj:
+                self.seq += 1
+                self.ready.emit(self.make_picture(fr), pos, self.W, self.H, self.seq)
+                return
+            if self.pool is None:
+                from concurrent.futures import ThreadPoolExecutor
+                self.pool = ThreadPoolExecutor(max_workers=self.pool_n)
+            self.seq += 1
+            with self.lock:
+                self.inflight += 1
+            self.pool.submit(self.filter_job, fr, pos, self.seq)
+
+        def filter_job(self, fr, pos, seq):
+            try:
+                t0 = time.perf_counter()
+                img = self.make_picture(fr)
+                dt = time.perf_counter() - t0
+                self.avg = dt if self.avg == 0 else self.avg * 0.8 + dt * 0.2
+                budget = self.pool_n / self.fps                        # time each frame may take to keep real time
+                if self.avg > budget * 0.85:
+                    self.lim = max(288, self.lim * 0.88)
+                elif self.avg < budget * 0.45 and self.lim < 640:
+                    self.lim = min(640, self.lim * 1.06)
+                if not self.stop_flag:
+                    self.ready.emit(img, pos, self.W, self.H, seq)
+            except Exception as e:
+                self.fails += 1
+                if self.fails >= 3:
+                    self.adj = {}
+                    self.failed.emit(f"This filter could not be applied to the video preview ({e}).")
+            finally:
+                with self.lock:
+                    self.inflight -= 1
+
+        def run(self):
+            try:
+                cap = cv2.VideoCapture(self.path)
+                if not cap.isOpened():
+                    self.failed.emit(f"Could not open {Path(self.path).name}. HEVC / H.265 videos may need the Microsoft 'HEVC Video Extensions'.")
+                    return
+                self.n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                self.fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+                self.W, self.H = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                self.dur_ms = int(self.n / self.fps * 1000) if self.n else 0
+                a, b = self.frame_range()
+                idx = a
+                cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                due = None
+                while not self.stop_flag:
+                    a, b = self.frame_range()
+                    if self.seek_to is not None:
+                        idx = min(max(int(self.seek_to / 1000.0 * self.fps), 0), max(self.n - 1, 0))
+                        self.seek_to = None
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                        ok, fr = cap.read()
+                        if ok:
+                            self.emit_frame(fr, idx)
+                            idx += 1
+                        due = None
+                        continue
+                    if self.redo:
+                        self.redo = False
+                        if self.raw is not None:
+                            self.emit_frame(self.raw, int(round(self.pos_ms / 1000.0 * self.fps)), sharp=True)
+                        continue
+                    if not self.playing:
+                        if self.settle and self.raw is not None:       # just paused: redraw this frame sharp
+                            self.settle = False
+                            self.emit_frame(self.raw, int(round(self.pos_ms / 1000.0 * self.fps)), sharp=True)
+                        self.wake.wait(0.05)
+                        self.wake.clear()
+                        due = None
+                        continue
+                    now = time.monotonic()
+                    if due is None:
+                        due = now
+                    if now < due:
+                        time.sleep(min(due - now, 0.01))
+                        continue
+                    if idx >= b or idx < a:
+                        idx = a
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                    behind = int((now - due) * self.fps)
+                    if behind >= 2:                  # filters / slow PC: drop frames to stay in time instead of lagging
+                        skip = min(behind, b - idx - 1)
+                        for _ in range(max(skip, 0)):
+                            cap.grab()
+                            idx += 1
+                        due += max(skip, 0) / self.fps
+                    if self.adj and self.inflight >= self.pool_n:      # filters are busy: skip this frame, keep real time
+                        cap.grab()
+                        idx += 1
+                        due += 1.0 / self.fps
+                        continue
+                    ok, fr = cap.read()
+                    if not ok:
+                        idx = a
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                        due = None
+                        time.sleep(0.02)
+                        continue
+                    self.submit_frame(fr, idx)
+                    idx += 1
+                    due += 1.0 / self.fps
+                cap.release()
+                if self.pool is not None:
+                    self.pool.shutdown(wait=False, cancel_futures=True)
+            except Exception as e:
+                self.failed.emit(f"Video playback stopped: {e}")
+
+    class VideoBridge(QObject):
+        """Lives on the GUI thread: receives the worker's pictures and hands them to the item."""
+        def __init__(self, item):
+            super().__init__()
+            self.ref = weakref.ref(item)
+
+        @Slot(object, int, int, int, int)
+        def on_ready(self, img, pos, W, H, seq):
+            it = self.ref()
+            if it is not None:
+                try:
+                    it.got_frame(img, W, H, seq)
+                except RuntimeError:
+                    pass
+
+        @Slot(str)
+        def on_failed(self, msg):
+            it = self.ref()
+            if it is not None:
+                try:
+                    sc = it.scene()
+                    if sc and sc.on_error:
+                        sc.on_error(f"{Path(it.path).name}: {msg}")
+                except RuntimeError:
+                    pass
+
+    class VideoItem(QGraphicsItem):
+        """Video layer. Plays silently in the editor; shows the cropped part with Edit Image filters applied live.
+        crop = [l, t, r, b] fractions of the frame; trim = (start_ms, end_ms) part of the clip that is kept;
+        data(5) = Edit Image settings (same as photos)."""
+        def __init__(self, path, size=None, fit_w=864, crop=None, adj=None, trim=None):
             super().__init__()
             self.path, self.fit_w = path, (fit_w if size is None else None)
-            self.audio = QAudioOutput()
-            self.audio.setMuted(True)
-            self.player = QMediaPlayer()
-            self.player.setAudioOutput(self.audio)
-            self.player.setVideoOutput(self)
-            self.player.setLoops(QMediaPlayer.Loops.Infinite)
-            self.setSize(size or QSizeF(640, 360))
-            self.nativeSizeChanged.connect(self._native)
-            self.player.errorOccurred.connect(self._err)
-            self.player.setSource(QUrl.fromLocalFile(path))
-            self.player.play()
+            self._size = QSizeF(size or QSizeF(640, 360))
+            self.crop, self.trim = crop, (tuple(trim) if trim else None)
+            self.setData(5, json.dumps(adj or {}))
+            self.disp = None                     # latest finished picture (QImage)
+            self.native = (0, 0)
+            self._still = None
+            self.worker = VideoWorker(path)
+            self.worker.crop, self.worker.adj, self.worker.trim = self.crop, self.adj(), self.trim
+            self.bridge = VideoBridge(self)
+            self.worker.ready.connect(self.bridge.on_ready)
+            self.worker.failed.connect(self.bridge.on_failed)
+            self.was_in_scene = False
+            self.last_seq = 0
+            watch_worker(self.worker, self)
 
-        def _err(self, err, msg):
+        def itemChange(self, change, value):
+            if change == QGraphicsItem.ItemSceneHasChanged:
+                if value is not None:
+                    self.was_in_scene = True
+                if value is not None and not self.worker.isRunning():
+                    self.worker.stop_flag = False
+                    self.worker.start()
+                elif value is None:
+                    self.worker.shutdown()       # removed from the canvas (delete / undo): stop its thread
+            return super().itemChange(change, value)
+
+        # ---- geometry
+        def size(self):
+            return QSizeF(self._size)
+
+        def setSize(self, sz):
+            self.prepareGeometryChange()
+            self._size = QSizeF(sz)
+            self.update()
+
+        def boundingRect(self):
+            return QRectF(0, 0, self._size.width(), self._size.height())
+
+        def adj(self):
+            return json.loads(self.data(5) or "{}")
+
+        # ---- playback
+        def duration(self):
+            return self.worker.dur_ms
+
+        def pause(self):
+            self.worker.poke(playing=False)
+
+        def play(self):
+            self.worker.poke(playing=True)
+
+        def toggle_play(self):
+            self.worker.poke(playing=not self.worker.playing)
+
+        def seek(self, ms):
+            self.worker.poke(playing=False, seek_to=int(ms))
+
+        def set_trim(self, trim):
+            self.trim = tuple(trim) if trim else None
+            self.worker.trim = self.trim
+            self.worker.poke(seek_to=self.trim[0] if self.trim else 0)
+
+        def refresh(self, preview=True):
+            """Edit Image settings or crop changed: redraw the current frame."""
+            self._still = None
+            self.worker.crop, self.worker.adj = self.crop, self.adj()
+            self.worker.poke(redo=True)
+
+        def poster(self):
+            """The current frame at full size (QImage), for cropping."""
+            fr = self.worker.raw
+            if fr is None:
+                return None
+            rgb = np.ascontiguousarray(cv2.cvtColor(fr, cv2.COLOR_BGR2RGB))
+            h, w = rgb.shape[:2]
+            return QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888).copy()
+
+        # ---- drawing
+        def got_frame(self, img, W, H, seq=0):
+            if seq and seq < self.last_seq:      # a slower, older frame arriving late: never show it
+                return
+            self.last_seq = seq
+            self.disp = img
+            self.native = (W, H)
+            if self.fit_w and W > 0:             # first frame: size the layer to the (cropped) picture
+                c = self.crop or [0, 0, 1, 1]
+                rw, rh = (c[2] - c[0]) * W, (c[3] - c[1]) * H
+                if rw > 0:
+                    self.setSize(QSizeF(self.fit_w, self.fit_w * rh / rw))
+                    self.fit_w = None
+                    self.setTransformOriginPoint(self.boundingRect().center())
+                    if self.scene() and self.scene().on_change:
+                        self.scene().on_change()
+            self.update()
+
+        def paint(self, p, opt, w=None):
+            r = self.boundingRect()
             sc = self.scene()
-            if sc and sc.on_error:
-                sc.on_error(f"{Path(self.path).name}: {msg}")
-
-        def _native(self, sz):
-            if self.fit_w and sz.width() > 0:
-                self.setSize(QSizeF(self.fit_w, self.fit_w * sz.height() / sz.width()))
-                self.fit_w = None
-                self.setTransformOriginPoint(self.boundingRect().center())
-                if self.scene() and self.scene().on_change:
-                    self.scene().on_change()
+            if getattr(sc, "exporting", False) and not getattr(sc, "live_preview", False) and self.worker.raw is not None:     # still-image export: full detail
+                key = (self.worker.pos_ms, json.dumps(self.crop), self.data(5))
+                if self._still is None or self._still[0] != key:
+                    self._still = (key, frame_pixmap(self.poster(), self.crop, self.adj(), None))
+                p.setRenderHint(QPainter.SmoothPixmapTransform)
+                p.drawPixmap(r, self._still[1], QRectF(self._still[1].rect()))
+            elif self.disp is not None:
+                p.setRenderHint(QPainter.SmoothPixmapTransform)
+                p.drawImage(r, self.disp)
+            else:
+                p.fillRect(r, QColor(20, 20, 24))
 
 LAYERS = (QGraphicsPixmapItem, TextItem, ShapeItem, GridItem) + ((VideoItem,) if HAS_VIDEO else ())
 
@@ -830,6 +1190,37 @@ class Canvas(QGraphicsScene):
         self.addItem(item)
         self.clearSelection()
         item.setSelected(True)
+
+
+def setup_gpu(view):
+    """Draw the canvas with the graphics card (OpenGL): photos are uploaded once and scaled by the GPU, which keeps
+    panning, zooming and dragging smooth with many layers. A guard flag turns it off automatically if the previous
+    start with GPU on did not finish cleanly (driver problem). Returns (active, note)."""
+    c = cfg()
+    if c.value("gpu", "true") != "true":
+        return False, "off (Settings)"
+    if QApplication.platformName() in ("offscreen", "minimal"):
+        return False, "not available here"
+    if c.value("gpu_guard", "0") == "1":
+        c.setValue("gpu", "false")
+        c.setValue("gpu_guard", "0")
+        return False, "turned off automatically after a graphics problem"
+    try:
+        from PySide6.QtOpenGLWidgets import QOpenGLWidget
+        from PySide6.QtGui import QSurfaceFormat
+        fmt = QSurfaceFormat()
+        fmt.setSamples(4)
+        fmt.setSwapInterval(1)
+        gl = QOpenGLWidget()
+        gl.setFormat(fmt)
+        c.setValue("gpu_guard", "1")
+        view.setViewport(gl)
+        view.setViewportUpdateMode(QGraphicsView.FullViewportUpdate)
+        QTimer.singleShot(6000, lambda: cfg().setValue("gpu_guard", "0"))     # still alive after 6 s = driver is fine
+        return True, "on"
+    except Exception as e:
+        c.setValue("gpu_guard", "0")
+        return False, f"unavailable ({e})"
 
 
 class View(QGraphicsView):
@@ -1614,21 +2005,43 @@ def apply_filter(x, f, a):
     return x
 
 
+_GRAIN = {}
+
+
+def grain_noise(shape):
+    """Same film grain for every frame / call of one size (it was recomputed every time)."""
+    key = tuple(shape)
+    n = _GRAIN.get(key)
+    if n is None:
+        _GRAIN.clear()
+        n = np.random.default_rng(1).standard_normal(key + (1,)).astype(np.float32)
+        _GRAIN[key] = n
+    return n
+
+
 def adjust_rgb(x, a):
     g = lambda k: a.get(k, 0) / 100.0
     lum = lambda v: v @ np.array([0.299, 0.587, 0.114], np.float32)
     sstep = lambda lo, hi, v: np.clip((v - lo) / (hi - lo), 0, 1)
-    x = x * (2 ** (g("exposure") * 1.5)) + g("brightness") * 0.3
-    x = np.clip((x - 0.5) * (1 + g("contrast")) + 0.5, 0, 1)
-    L = lum(x)[..., None]
-    x = x + g("highlights") * 0.35 * sstep(0.5, 1, L) + g("shadows") * 0.35 * (1 - sstep(0, 0.5, L))
-    x[..., 0] += g("temperature") * 0.12 + g("tint") * 0.04
-    x[..., 2] -= g("temperature") * 0.12 - g("tint") * 0.04
-    x[..., 1] -= g("tint") * 0.08
-    x = np.clip(x, 0, 1)
-    gray = lum(x)[..., None]
-    sat = (x.max(-1, keepdims=True) - x.min(-1, keepdims=True))
-    x = gray + (x - gray) * (1 + g("saturation") + g("vibrance") * (1 - sat))
+    if g("exposure") or g("brightness"):
+        x = x * (2 ** (g("exposure") * 1.5)) + g("brightness") * 0.3
+    x = np.clip((x - 0.5) * (1 + g("contrast")) + 0.5, 0, 1) if g("contrast") else np.clip(x, 0, 1)
+    changed = False
+    if g("highlights") or g("shadows"):
+        L = lum(x)[..., None]
+        x = x + g("highlights") * 0.35 * sstep(0.5, 1, L) + g("shadows") * 0.35 * (1 - sstep(0, 0.5, L))
+        changed = True
+    if g("temperature") or g("tint"):
+        x[..., 0] += g("temperature") * 0.12 + g("tint") * 0.04
+        x[..., 2] -= g("temperature") * 0.12 - g("tint") * 0.04
+        x[..., 1] -= g("tint") * 0.08
+        changed = True
+    if changed:
+        x = np.clip(x, 0, 1)
+    if g("saturation") or g("vibrance"):
+        gray = lum(x)[..., None]
+        sat = (x.max(-1, keepdims=True) - x.min(-1, keepdims=True))
+        x = gray + (x - gray) * (1 + g("saturation") + g("vibrance") * (1 - sat))
     f = a.get("filter", "None")
     if f != "None":
         pre = x
@@ -1643,7 +2056,7 @@ def adjust_rgb(x, a):
     if a.get("sharpen"):
         x = x + (a["sharpen"] / 100 * 1.5) * (x - box_blur(x, max(1, int(1.5 * size))))
     if a.get("grain"):
-        x = x + np.random.default_rng(1).normal(0, a["grain"] / 100 * 0.12, x.shape[:2] + (1,)).astype(np.float32)
+        x = x + grain_noise(x.shape[:2]) * (a["grain"] / 100 * 0.12)
     return np.clip(x, 0, 1)
 
 
@@ -3446,15 +3859,23 @@ class PreviewWindow(QWidget):
         self.saved_guides = sc.show_guides
         sc.clearSelection()
         sc.exporting = True                      # hides guides / handles while previewing
+        sc.live_preview = True                   # videos keep drawing their cheap live frames (not the full-detail export path)
         self.show_hint = True
         self.hint_timer = QTimer(self)
         self.hint_timer.setSingleShot(True)
         self.hint_timer.timeout.connect(self.hide_hint)
         self.hint_timer.start(3500)
-        self.tick = QTimer(self)                 # keep videos moving
-        self.tick.timeout.connect(self.update)
-        if HAS_VIDEO and any(isinstance(i, VideoItem) for i in sc.items()):
-            self.tick.start(40)
+        self.has_video = HAS_VIDEO and any(isinstance(i, VideoItem) for i in sc.items())
+        self.last_draw = 0.0
+        if self.has_video:                       # repaint when a video frame arrives (not on a blind timer) ...
+            sc.changed.connect(self.on_scene_changed)
+            main.view.setUpdatesEnabled(False)   # ... and stop the hidden editor view from drawing the same frames
+        self.moving = False
+
+    def on_scene_changed(self, _rects=None):
+        now = time.monotonic()
+        if now - self.last_draw >= 0.03 and not self.anim.state() == QVariantAnimation.Running:
+            self.update()
 
     def on_anim(self, v):
         self.cur = QPointF(v)
@@ -3484,7 +3905,12 @@ class PreviewWindow(QWidget):
         self.k = min(self.width() / r.width(), self.height() / r.height())
         tw, th = r.width() * self.k, r.height() * self.k
         target = QRectF((self.width() - tw) / 2, (self.height() - th) / 2, tw, th)
-        p.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform | QPainter.TextAntialiasing)
+        self.last_draw = time.monotonic()
+        moving = self.anim.state() == QVariantAnimation.Running or self.dragging
+        if moving and self.has_video:            # gliding between slides: cheaper drawing, full quality again at rest
+            p.setRenderHints(QPainter.TextAntialiasing)
+        else:
+            p.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform | QPainter.TextAntialiasing)
         p.setClipRect(target)                    # nothing may spill into the black bars around the slides
         self.sc.render(p, target, r, Qt.KeepAspectRatio)
         if self.show_hint:
@@ -3548,8 +3974,14 @@ class PreviewWindow(QWidget):
 
     def closeEvent(self, e):
         self.anim.stop()
-        self.tick.stop()
+        if self.has_video:
+            try:
+                self.sc.changed.disconnect(self.on_scene_changed)
+            except (RuntimeError, TypeError):
+                pass
+            self.m.view.setUpdatesEnabled(True)
         self.sc.exporting = False
+        self.sc.live_preview = False
         self.sc.show_guides = self.saved_guides
         for it in self.saved_sel:
             try:
@@ -3604,7 +4036,7 @@ def save_image_hq(img, base, fmt):
             return None
         if fmt == "webp":
             if pil is not None:
-                pil.save(str(path), "WEBP", lossless=True, quality=100, method=6)
+                pil.save(str(path), "WEBP", lossless=True, quality=100, method=4)
                 return None
             return None if img.save(str(path), "WEBP", 100) else f"Could not write {path.name}"
         if fmt in ("heic", "heif"):
@@ -3624,13 +4056,412 @@ def save_image_hq(img, base, fmt):
     return f"Unknown format {fmt}"
 
 
-class ExportDialog(QDialog):
-    """Export slides: format, resolution, folder. Quality first - nothing is compressed to save space."""
-    def __init__(self, parent, auto_scale):
+FFMPEG = None
+
+
+def find_ffmpeg():
+    """ffmpeg executable: the one bundled with imageio-ffmpeg, else one on PATH."""
+    try:
+        import imageio_ffmpeg
+        p = imageio_ffmpeg.get_ffmpeg_exe()
+        if p and os.path.exists(p):
+            return p
+    except Exception:
+        pass
+    return shutil.which("ffmpeg")
+
+
+def probe_audio(ff, path):
+    """'aac' / other codec name of the first audio stream, or '' if the video has no sound."""
+    try:
+        kw = {"creationflags": 0x08000000} if sys.platform == "win32" else {}
+        r = subprocess.run([ff, "-hide_banner", "-i", path], capture_output=True, text=True, timeout=30, **kw)
+        for line in (r.stderr or "").splitlines():
+            if "Audio:" in line:
+                return line.split("Audio:")[1].strip().split(" ")[0].strip(",").lower()
+    except Exception:
+        pass
+    return ""
+
+
+def fps_str(fps):
+    for a, b in ((23.976, "24000/1001"), (29.97, "30000/1001"), (47.952, "48000/1001"), (59.94, "60000/1001")):
+        if abs(fps - a) < 0.01:
+            return b
+    return f"{fps:.3f}"
+
+
+def video_frame_image(cv2, fr, crop, adj, tw, th):
+    """Original BGR frame -> crop -> resized to the export size -> Edit Image filters -> QImage. Safe to run on worker threads."""
+    H, W = fr.shape[:2]
+    if crop:
+        x0, y0 = int(crop[0] * W), int(crop[1] * H)
+        fr = fr[y0:max(y0 + 1, int(crop[3] * H)), x0:max(x0 + 1, int(crop[2] * W))]
+    interp = cv2.INTER_AREA if fr.shape[1] > tw else cv2.INTER_LANCZOS4
+    fr = cv2.resize(fr, (tw, th), interpolation=interp)
+    rgb = np.ascontiguousarray(cv2.cvtColor(fr, cv2.COLOR_BGR2RGB))
+    if adj:
+        rgb = (np.clip(adjust_rgb(rgb.astype(np.float32) / 255.0, adj), 0, 1) * 255 + 0.5).astype(np.uint8)
+        rgb = np.ascontiguousarray(rgb)
+    return QImage(rgb.data, tw, th, tw * 3, QImage.Format_RGB888).copy()
+
+
+def video_frame_pixmap(cv2, fr, crop, adj, tw, th):
+    return QPixmap.fromImage(video_frame_image(cv2, fr, crop, adj, tw, th))
+
+
+# ---------------------------------------------------------------- export: resource limits, memory estimate, progress
+def available_ram_mb():
+    """Free memory (MB) that new allocations can use."""
+    try:
+        if sys.platform == "win32":
+            import ctypes
+
+            class MEMSTAT(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong), ("ullTotalPhys", ctypes.c_ulonglong),
+                            ("ullAvailPhys", ctypes.c_ulonglong), ("ullTotalPageFile", ctypes.c_ulonglong),
+                            ("ullAvailPageFile", ctypes.c_ulonglong), ("ullTotalVirtual", ctypes.c_ulonglong),
+                            ("ullAvailVirtual", ctypes.c_ulonglong), ("sullAvailExtendedVirtual", ctypes.c_ulonglong)]
+            st = MEMSTAT()
+            st.dwLength = ctypes.sizeof(MEMSTAT)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st))
+            return st.ullAvailPhys / 1048576.0
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable"):
+                    return int(line.split()[1]) / 1024.0
+    except Exception:
+        pass
+    return None
+
+
+def est_export_mb(fmt, W, H, video=False):
+    """Rough peak memory (MB) for one slide at W x H. Deliberately on the high side."""
+    px = W * H
+    per = {"png": 12, "bmp": 10, "tiff": 16, "webp": 30, "jpg": 14, "jfif": 14, "heic": 90, "heif": 90}.get(fmt, 20)
+    return px * per / 1048576.0 + 300
+
+
+VIDEO_MAX_SCALE = 2      # video slides are never exported larger than 2x: bigger needs many GB for the encoder and no phone plays it
+
+
+def video_scale(scale):
+    return min(scale, VIDEO_MAX_SCALE)
+
+
+def est_video_mb(W, H):
+    """Peak memory (MB) of the video encoder + frame buffers for one video slide at W x H (measured, with a safety margin)."""
+    return W * H * 140 / 1048576.0 + 500
+
+
+def video_workers(limits, sizes, has_filters):
+    """How many frames may be filtered at the same time: about half of the allowed threads, but never more than the
+    memory budget allows (one frame in the filter needs ~100 bytes per pixel)."""
+    if not has_filters:
+        return 1
+    n = max(1, (limits.threads or 2) // 2) if limits.mode != "fast" else max(1, limits.threads - 1)
+    per = max(w * h for w, h in sizes) * 100 / 1048576.0
+    budget = 1200.0
+    av = available_ram_mb()
+    if av:
+        budget = min(budget, av * 0.2)
+    return int(max(1, min(n, 6, budget // max(per, 1))))
+
+
+class ExportLimits:
+    """While exporting, keep the PC usable: lower priority and use only part of the CPU cores.
+    mode: 'balanced' (about half, recommended), 'gentle' (2 cores), 'fast' (everything)."""
+    def __init__(self, mode="balanced"):
+        self.mode, self.threads, self.low_priority = mode, os.cpu_count() or 2, mode != "fast"
+        self.saved = None
+
+    def pick(self, cpus):
+        n = len(cpus)
+        want = n if self.mode == "fast" else (min(2, n) if self.mode == "gentle" else max(1, n // 2))
+        if want >= n:
+            return list(cpus)
+        step = max(1, n // want)          # every other logical CPU = one thread per physical core on SMT chips
+        return list(cpus)[::step][:want]
+
+    def __enter__(self):
+        try:
+            if sys.platform == "win32":
+                import ctypes
+                k = ctypes.windll.kernel32
+                h = k.GetCurrentProcess()
+                pm, sm = ctypes.c_size_t(), ctypes.c_size_t()
+                k.GetProcessAffinityMask(h, ctypes.byref(pm), ctypes.byref(sm))
+                cpus = [b for b in range(64) if pm.value >> b & 1]
+                keep = self.pick(cpus)
+                self.saved = (k.GetPriorityClass(h), pm.value)
+                if self.low_priority:
+                    k.SetPriorityClass(h, 0x4000)                      # BELOW_NORMAL
+                if len(keep) < len(cpus):
+                    k.SetProcessAffinityMask(h, sum(1 << b for b in keep))
+                self.threads = len(keep)
+            elif hasattr(os, "sched_getaffinity"):
+                cpus = sorted(os.sched_getaffinity(0))
+                keep = self.pick(cpus)
+                self.saved = (None, set(cpus))
+                os.sched_setaffinity(0, set(keep))
+                self.threads = len(keep)
+        except Exception:
+            pass
+        return self
+
+    def __exit__(self, *a):
+        try:
+            if self.saved is None:
+                return
+            if sys.platform == "win32":
+                import ctypes
+                k = ctypes.windll.kernel32
+                h = k.GetCurrentProcess()
+                k.SetPriorityClass(h, self.saved[0] or 0x20)
+                k.SetProcessAffinityMask(h, self.saved[1])
+            elif hasattr(os, "sched_setaffinity"):
+                os.sched_setaffinity(0, self.saved[1])
+        except Exception:
+            pass
+
+
+class ExportProgress:
+    """One progress bar for the whole export: overall percentage, what is happening now, time left. Cancel supported."""
+    def __init__(self, parent, total_units):
+        self.total, self.done, self.t0 = max(1, total_units), 0.0, time.monotonic()
+        self.dlg = QProgressDialog("Starting export...", "Cancel", 0, 1000, parent)
+        self.dlg.setWindowTitle("Exporting")
+        self.dlg.setWindowModality(Qt.WindowModal)
+        self.dlg.setMinimumDuration(0)
+        self.dlg.setAutoClose(False)
+        self.dlg.setAutoReset(False)
+        self.dlg.setMinimumWidth(440)
+        self.dlg.setValue(0)
+        QApplication.processEvents()
+
+    def update(self, units, text):
+        self.done = min(units, self.total)
+        f = self.done / self.total
+        el = time.monotonic() - self.t0
+        eta = f"   -   about {self.fmt_t(el * (1 - f) / f)} left" if f > 0.04 and el > 3 else ""
+        self.dlg.setLabelText(f"{text}\n{int(f * 100)}%{eta}")
+        self.dlg.setValue(int(f * 1000))
+        QApplication.processEvents()
+
+    @staticmethod
+    def fmt_t(sec):
+        sec = int(sec)
+        return f"{sec // 60} min {sec % 60:02d} s" if sec >= 60 else f"{sec} s"
+
+    def canceled(self):
+        QApplication.processEvents()
+        return self.dlg.wasCanceled()
+
+    def close(self):
+        self.dlg.close()
+
+
+def encoder_cmd(ff, W, H, fs, aud, out, level, threads=0):
+    """ffmpeg command line. level 0 = best (near-lossless H.264, original audio copied), 1 = plain H.264 (maximum compatibility),
+    2 = MPEG-4 part 2 (only if H.264 is missing from this ffmpeg)."""
+    cmd = [ff, "-y", "-hide_banner", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "bgra",
+           "-video_size", f"{W}x{H}", "-framerate", fs, "-i", "-"]
+    for i in aud:
+        cmd += ["-ss", f"{i['a'] / i['fps']:.4f}", "-t", f"{(i['b'] - i['a']) / i['fps']:.4f}", "-i", i["v"].path]
+    if len(aud) > 1:
+        mix = "".join(f"[{n + 1}:a]" for n in range(len(aud))) + f"amix=inputs={len(aud)}:duration=longest[a]"
+        cmd += ["-filter_complex", mix, "-map", "0:v:0", "-map", "[a]", "-c:a", "aac", "-b:a", "320k"]
+    elif len(aud) == 1:
+        cmd += ["-map", "0:v:0", "-map", "1:a:0"]
+        cmd += ["-c:a", "copy"] if (level <= 0 and aud[0]["audio"] == "aac") else ["-c:a", "aac", "-b:a", "320k"]
+    else:
+        cmd += ["-map", "0:v:0"]
+    x264 = "rc-lookahead=10:bframes=2:ref=3:sync-lookahead=0:frame-threads=%d" % min(max(threads, 1), 3)   # small look-ahead: far less memory
+    if level == -1:          # NVIDIA graphics card encoder: very fast, hardly any CPU, high quality (not mathematically near-lossless)
+        cmd += ["-c:v", "h264_nvenc", "-preset", "p6", "-tune", "hq", "-rc", "vbr", "-cq", "12", "-b:v", "0", "-profile:v", "high",
+                "-r", fs, "-vf", "scale=out_color_matrix=bt709:out_range=tv,format=yuv420p",
+                "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-movflags", "+faststart"]
+    elif level == 0:
+        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-x264-params", x264, "-crf", "10", "-profile:v", "high", "-r", fs,
+                "-vf", "scale=out_color_matrix=bt709:out_range=tv,format=yuv420p",
+                "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-movflags", "+faststart"]
+    elif level == 1:
+        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-x264-params", x264, "-crf", "10", "-pix_fmt", "yuv420p", "-r", fs, "-movflags", "+faststart"]
+    else:
+        cmd += ["-c:v", "mpeg4", "-q:v", "1", "-pix_fmt", "yuv420p", "-r", fs]
+    if threads:
+        cmd += ["-threads", str(threads)]
+    return cmd + [str(out)]
+
+
+def run_hidden(cmd, low_priority=False, **kw):
+    if sys.platform == "win32":
+        kw["creationflags"] = 0x08000000 | (0x4000 if low_priority else 0)      # no console window / below-normal priority
+    return subprocess.Popen(cmd, **kw)
+
+
+def preflight_encoder(ff, aud, fs, folder, gpu=False, size=(1080, 1350)):
+    """Try a 3-frame test encode with the real settings; returns (level, log). Picks the best level that works.
+    gpu=True tries the graphics-card encoder first (tested at the real video size)."""
+    log = []
+    test = Path(folder) / ".aero_encoder_test.mp4"
+    for level in ((-1, 0, 1, 2) if gpu else (0, 1, 2)):
+        ef = tempfile.TemporaryFile()
+        tw, th = (size[0], size[1]) if level == -1 else (128, 128)
+        try:
+            pc = run_hidden(encoder_cmd(ff, tw, th, fs, aud, test, level), stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=ef)
+            try:
+                pc.stdin.write(bytes(tw * th * 4 * 3))
+                pc.stdin.close()
+            except OSError:
+                pass
+            rc = pc.wait(timeout=60)
+            ef.seek(0)
+            msg = ef.read().decode(errors="replace").strip()
+            if rc == 0 and test.exists():
+                return level, log
+            log.append(f"[level {level}] exit code {rc}: {msg[-400:]}")
+        except Exception as e:
+            log.append(f"[level {level}] {e}")
+        finally:
+            ef.close()
+            try:
+                test.unlink()
+            except OSError:
+                pass
+    return None, log
+
+
+def slide_rect(sc, k):
+    return QRectF((k % sc.n) * sc.pw, (k // sc.n) * sc.ph, sc.pw, sc.ph)
+
+
+def video_slide_map(sc):
+    """{slide index: [video layers that appear on it]}."""
+    out = {}
+    vids = [i for i in sc.items() if HAS_VIDEO and isinstance(i, VideoItem) and i.parentItem() is None]
+    for k in range(sc.n * sc.rows):
+        r = slide_rect(sc, k)
+        on = [v for v in vids if v.sceneBoundingRect().intersected(r).width() > 0.5 and v.sceneBoundingRect().intersected(r).height() > 0.5]
+        if on:
+            out[k] = sorted(on, key=lambda v: v.zValue())
+    return out
+
+
+def need_video_tools(parent):
+    """True when OpenCV, numpy and ffmpeg are all available (else tells the user)."""
+    global FFMPEG
+    FFMPEG = find_ffmpeg()
+    if cv2 is None or np is None or FFMPEG is None:
+        QMessageBox.warning(parent, "Export", "This project has videos, and exporting them needs these packages:\n\n"
+                                              "pip install opencv-python numpy imageio-ffmpeg")
+        return False
+    return True
+
+
+class TrimDialog(QDialog):
+    """Keep only part of a video: pick the start and end; the canvas shows the frame while you drag."""
+    def __init__(self, parent, v):
         super().__init__(parent)
-        self.setWindowTitle("Export slides")
+        self.v, self.old = v, v.trim
+        self.setWindowTitle("Trim video length")
         self.setFixedWidth(460)
-        self.fmt, self.scale, self.folder, self.auto = "png", 2, "", auto_scale
+        dur = max(int(v.duration()), 0)
+        self.dur = dur
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(24, 20, 24, 20)
+        lay.setSpacing(8)
+        if dur <= 0:
+            lay.addWidget(QLabel("The video is still loading. Close this and try again in a moment."))
+            b = QPushButton("Close")
+            b.clicked.connect(self.reject)
+            lay.addWidget(b)
+            self.sl = None
+            return
+        lay.addWidget(QLabel("Keep only this part of the video. The rest is not used in the editor or in the exported slides."))
+        st, en = (v.trim or (0, dur))
+        self.sl, self.sp = {}, {}
+        for key, label, val in (("start", "Start (seconds)", st), ("end", "End (seconds)", en)):
+            lay.addWidget(QLabel(label))
+            row = QHBoxLayout()
+            sl = QSlider(Qt.Horizontal)
+            sl.setRange(0, dur)
+            sl.setValue(int(val))
+            sp = QDoubleSpinBox()
+            sp.setDecimals(2)
+            sp.setRange(0, dur / 1000.0)
+            sp.setValue(val / 1000.0)
+            sp.setSingleStep(0.1)
+            sp.setFixedWidth(90)
+            sl.valueChanged.connect(lambda x, k=key: self.changed(k, x, True))
+            sp.valueChanged.connect(lambda x, k=key: self.changed(k, int(round(x * 1000)), False))
+            row.addWidget(sl, 1)
+            row.addWidget(sp)
+            lay.addLayout(row)
+            self.sl[key], self.sp[key] = sl, sp
+        self.info = QLabel("")
+        self.info.setStyleSheet("color: palette(mid);")
+        lay.addWidget(self.info)
+        row = QHBoxLayout()
+        reset = QPushButton("Use whole video")
+        reset.clicked.connect(self.whole)
+        row.addWidget(reset)
+        row.addStretch(1)
+        ok = QPushButton("OK")
+        ok.setObjectName("primary")
+        ok.clicked.connect(self.accept)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        row.addWidget(cancel)
+        row.addWidget(ok)
+        lay.addLayout(row)
+        v.pause()
+        self.update_info()
+        self.setFixedHeight(self.sizeHint().height())
+
+    def changed(self, key, ms, from_slider):
+        other = "end" if key == "start" else "start"
+        if key == "start" and ms >= self.sl["end"].value() - 100:
+            ms = max(0, self.sl["end"].value() - 100)
+        if key == "end" and ms <= self.sl["start"].value() + 100:
+            ms = min(self.dur, self.sl["start"].value() + 100)
+        for w, val in ((self.sl[key], ms), (self.sp[key], ms / 1000.0)):
+            w.blockSignals(True)
+            w.setValue(val)
+            w.blockSignals(False)
+        self.v.seek(ms)                              # show that frame on the canvas
+        self.update_info()
+
+    def whole(self):
+        for key, val in (("start", 0), ("end", self.dur)):
+            self.sl[key].blockSignals(True); self.sp[key].blockSignals(True)
+            self.sl[key].setValue(val); self.sp[key].setValue(val / 1000.0)
+            self.sl[key].blockSignals(False); self.sp[key].blockSignals(False)
+        self.update_info()
+
+    def update_info(self):
+        a, b = self.sl["start"].value(), self.sl["end"].value()
+        self.info.setText(f"Kept length: {(b - a) / 1000.0:.2f} s  of  {self.dur / 1000.0:.2f} s")
+
+    def result_trim(self):
+        a, b = self.sl["start"].value(), self.sl["end"].value()
+        return None if (a <= 0 and b >= self.dur) else (a, b)
+
+    def exec(self):
+        if self.sl is None:
+            super().exec()
+            return False
+        return super().exec()
+
+
+class ExportDialog(QDialog):
+    """Export: format, resolution, folder, how hard the PC may work. Quality first - nothing is compressed to save space."""
+    def __init__(self, parent, auto_scale, n_videos=0, video_slides=()):
+        super().__init__(parent)
+        self.n_videos, self.video_slides = n_videos, list(video_slides)
+        self.setWindowTitle("Export")
+        self.setFixedWidth(480)
+        self.fmt, self.scale, self.folder, self.auto, self.perf, self.gpu = "png", 2, "", auto_scale, "balanced", False
         self.sc = parent.scene
         lay = QVBoxLayout(self)
         lay.setContentsMargins(24, 20, 24, 20)
@@ -3639,10 +4470,11 @@ class ExportDialog(QDialog):
         self.f = QComboBox()
         for label, _ in EXPORT_FORMATS:
             self.f.addItem(label)
+        self.f.currentIndexChanged.connect(self.format_changed)
         lay.addWidget(self.f)
         lay.addWidget(QLabel("Resolution"))
         self.r = QComboBox()
-        self.r.addItem(f"Best detail (automatic: {auto_scale}x)", 0)
+        self.r.addItem("", 0)
         for k in (1, 2, 3, 4):
             self.r.addItem(f"{k}x", k)
         self.r.currentIndexChanged.connect(self.info)
@@ -3651,6 +4483,32 @@ class ExportDialog(QDialog):
         self.note.setWordWrap(True)
         self.note.setStyleSheet("color: palette(mid);")
         lay.addWidget(self.note)
+        if n_videos:
+            vs = ", ".join(str(k + 1) for k in self.video_slides)
+            vn = QLabel(f"This project has {n_videos} video(s) on slide(s) {vs}. Those slides are exported as MP4 "
+                        f"(near-lossless, original frame rate and sound); all other slides use the format above. "
+                        f"Everything goes into the same folder, numbered in slide order.")
+            vn.setWordWrap(True)
+            vn.setStyleSheet("color: palette(mid);")
+            lay.addWidget(vn)
+        self.venc = None
+        if n_videos:
+            lay.addWidget(QLabel("Video encoder"))
+            self.venc = QComboBox()
+            self.venc.addItem("Best quality - processor (recommended)", False)
+            self.venc.addItem("Much faster - graphics card (NVIDIA), if available", True)
+            lay.addWidget(self.venc)
+            hint = QLabel("The graphics-card encoder is very fast and keeps the processor free; the picture is still high quality "
+                          "but the files are not as near-lossless. If your card cannot do it, Aero uses the processor automatically.")
+            hint.setWordWrap(True)
+            hint.setStyleSheet("color: palette(mid);")
+            lay.addWidget(hint)
+        lay.addWidget(QLabel("Computer load"))
+        self.p = QComboBox()
+        self.p.addItem("Balanced - about half of your CPU (recommended)", "balanced")
+        self.p.addItem("Gentle - 2 cores, best for working while it exports", "gentle")
+        self.p.addItem("Fast - all CPU cores", "fast")
+        lay.addWidget(self.p)
         lay.addSpacing(4)
         lay.addWidget(QLabel("Save to"))
         row = QHBoxLayout()
@@ -3666,22 +4524,51 @@ class ExportDialog(QDialog):
         go.setDefault(True)
         go.clicked.connect(self.go)
         lay.addWidget(go)
-        self.info()
+        self.format_changed()
         self.setFixedHeight(self.sizeHint().height())
 
+    def cur_fmt(self):
+        return EXPORT_FORMATS[self.f.currentIndex()][1]
+
+    def auto_for(self, fmt):
+        """HEIC / HEIF at 4x is a 23-megapixel encode that needs many GB of memory: 'Best detail' stops at 2x for them
+        ."""
+        if fmt in ("heic", "heif"):
+            return min(self.auto, 2)
+        return self.auto
+
+    def format_changed(self, *_):
+        k = self.auto_for(self.cur_fmt())
+        self.r.setItemText(0, f"Best detail (automatic: {k}x)")
+        self.info()
+
     def info(self, *_):
-        k = self.r.currentData() or self.auto
-        self.note.setText(f"Each slide is saved at {int(self.sc.pw * k)} x {int(self.sc.ph * k)} px. Text and shapes are drawn "
-                          f"sharp at that size and photos keep their full detail.")
+        fmt = self.cur_fmt()
+        k = self.r.currentData() or self.auto_for(fmt)
+        W, H = int(self.sc.pw * k), int(self.sc.ph * k)
+        mb = est_export_mb(fmt, W, H)
+        txt = (f"Each slide is saved at {W} x {H} px. Text and shapes are drawn sharp at that size and photos keep "
+               f"their full detail.")
+        if self.n_videos:
+            vk = video_scale(k)
+            mb = max(mb, est_video_mb(int(self.sc.pw * vk), int(self.sc.ph * vk)))
+            txt += (f"  Video slides are saved at {int(self.sc.pw * vk)} x {int(self.sc.ph * vk)} px "
+                    f"({vk}x, the largest size that is safe for video).")
+        txt += f"  Estimated memory: about {mb / 1024:.1f} GB."
+        if fmt in ("heic", "heif") and k >= 3:
+            txt += "  HEIC / HEIF at this size is slow and memory-hungry; 2x is recommended."
+        self.note.setText(txt)
 
     def choose(self):
-        d = QFileDialog.getExistingDirectory(self, "Export slides to folder", self.loc.text())
+        d = QFileDialog.getExistingDirectory(self, "Export to folder", self.loc.text())
         if d:
             self.loc.setText(d)
 
     def go(self):
-        self.fmt = EXPORT_FORMATS[self.f.currentIndex()][1]
-        self.scale = self.r.currentData() or self.auto
+        self.fmt = self.cur_fmt()
+        self.scale = self.r.currentData() or self.auto_for(self.fmt)
+        self.perf = self.p.currentData()
+        self.gpu = bool(self.venc.currentData()) if self.venc is not None else False
         self.folder = self.loc.text().strip()
         try:
             Path(self.folder).mkdir(parents=True, exist_ok=True)
@@ -3984,6 +4871,19 @@ class SettingsDialog(QDialog):
         note = QLabel("Your choice is saved. Translated interface text is not part of this beta build yet, so the app still shows English.")
         note.setWordWrap(True)
         gl.addWidget(note)
+        gl.addSpacing(8)
+        gl.addWidget(QLabel("Performance"))
+        self.gpu = QCheckBox("Use the graphics card (GPU) to draw the canvas")
+        self.gpu.setChecked(c.value("gpu", "true") == "true")
+        self.gpu.toggled.connect(lambda on: (cfg().setValue("gpu", "true" if on else "false"), cfg().setValue("gpu_guard", "0")))
+        gl.addWidget(self.gpu)
+        m = parent
+        status = getattr(m, "gpu_note", "unknown")
+        gnote = QLabel(f"Smoother panning and zooming with many photos, texts and filters. Takes effect the next time you start Aero.\n"
+                       f"Right now: GPU drawing is {'ACTIVE' if getattr(m, 'gpu_active', False) else 'not active'} ({status}).")
+        gnote.setWordWrap(True)
+        gnote.setStyleSheet("color: palette(mid);")
+        gl.addWidget(gnote)
         gl.addStretch()
         tabs.addTab(g, "General")
         # Appearance
@@ -4440,6 +5340,7 @@ class Main(QMainWindow):
         self.scene.on_transform = lambda: self.sync_controls(False)
         self.scene.on_error = self.video_error
         self.view = View(self.scene)
+        self.gpu_active, self.gpu_note = setup_gpu(self.view)
         self.view.on_delete = self.delete_selected
         self.view.on_nudge = lambda dx, dy: self.nudge(dx, dy)
         self.setCentralWidget(self.view)
@@ -4505,8 +5406,7 @@ class Main(QMainWindow):
         self._act(m, "Save As...", self.save_as, QKeySequence.SaveAs)
         self._act(m, "Close Project", self.close_project, "Ctrl+W")
         m.addSeparator()
-        self._act(m, "Export Slides...", self.export)
-        self._act(m, "Export Video (.mp4)...", self.export_video)
+        self._act(m, "Export...", self.export)
         m.addSeparator()
         self._act(m, "Settings...", lambda: SettingsDialog(self).exec())
         e = self.menuBar().addMenu("&Edit")
@@ -4525,6 +5425,9 @@ class Main(QMainWindow):
         self._act(m, "Full Screen Preview (2 slides)", self.preview_fullscreen, "F11")
         self._act(m, "Toggle Guides", self.toggle_guides)
         m = self.menuBar().addMenu("&Insert")
+        self._act(m, "Add Image", self.add_image)
+        self._act(m, "Add Video", self.add_video)
+        m.addSeparator()
         self._act(m, "Rectangle", lambda: self.add_shape("rect"))
         self._act(m, "Ellipse", lambda: self.add_shape("ellipse"))
         self._act(m, "Line", lambda: self.add_shape("line"))
@@ -4532,13 +5435,13 @@ class Main(QMainWindow):
         self._act(m, "Grid Layouts...", self.add_grid)
         self._act(m, "Grid (plain 2 x 2)", self.add_grid_simple)
         self._act(m, "Overlay (tinted layer over all slides)", self.add_overlay)
-        self._act(m, "Video...", self.add_video)
         self._act(m, "Play / Pause Videos", self.toggle_video)
         m = self.menuBar().addMenu("&Layer")
         self._act(m, "Duplicate", self.duplicate, "Ctrl+D")
         self._act(m, "Center in Slide", self.center_in_slide)
         self._act(m, "Crop Image...", self.crop_image)
         self._act(m, "Replace Image...", self.replace_image)
+        self._act(m, "Trim Video Length...", self.trim_video)
         self._act(m, "Fill Grid Cells with Images...", self.fill_grid)
         self._act(m, "Grid Settings...", self.grid_settings)
         self._act(m, "Lock / Unlock", self.toggle_lock, "Ctrl+L")
@@ -4580,6 +5483,7 @@ class Main(QMainWindow):
         tb.addAction("Redo", self.redo)
         tb.addSeparator()
         tb.addAction("Add Image", self.add_image)
+        tb.addAction("Add Video", self.add_video)
         tb.addAction("Add Text", self.add_text)
         tb.addAction("Crop", self.crop_image)
         tb.addAction("Replace Image", self.replace_image)
@@ -4610,8 +5514,7 @@ class Main(QMainWindow):
         snap.setChecked(True)
         snap.toggled.connect(lambda v: setattr(self.scene, "snap_enabled", v))
         tb.addSeparator()
-        tb.addAction("Export Slides", self.export)
-        tb.addAction("Export MP4", self.export_video)
+        tb.addAction("Export", self.export)
 
     def _build_side_panel(self):
         w = QWidget()
@@ -4673,7 +5576,8 @@ class Main(QMainWindow):
                      radius=it.radius, corners=list(it.corners), shadow=it.shadow, dash=it.dash,
                      bpos=it.bpos, bjoin=it.bjoin, nofill=it.no_fill, noborder=it.no_border)
         elif HAS_VIDEO and isinstance(it, VideoItem):
-            d.update(type="video", path=it.path, w=round(it.size().width(), 1), h=round(it.size().height(), 1))
+            d.update(type="video", path=it.path, w=round(it.size().width(), 1), h=round(it.size().height(), 1),
+                     crop=it.crop, adj=it.adj(), trim=list(it.trim) if it.trim else None)
         else:
             d.update(type="image", id=it.data(0), adj=json.loads(it.data(5) or "{}"), crop=json.loads(it.data(6) or "null"),
                      mask=it.data(7))
@@ -4721,7 +5625,7 @@ class Main(QMainWindow):
         elif t == "video":
             if not HAS_VIDEO:
                 return
-            it = VideoItem(d["path"], QSizeF(d["w"], d["h"]))
+            it = VideoItem(d["path"], QSizeF(d["w"], d["h"]), crop=d.get("crop"), adj=d.get("adj"), trim=d.get("trim"))
         else:
             pm = self.pixmaps.get(d["id"])
             if pm is None:
@@ -5075,6 +5979,8 @@ class Main(QMainWindow):
     def refresh_image(self, it, preview=False):
         if isinstance(it, CellRef):
             return it.refresh(self, preview)
+        if HAS_VIDEO and isinstance(it, VideoItem):
+            return it.refresh(preview)
         orig = self.pixmaps.get(it.data(0))
         if orig is None:
             return
@@ -5211,7 +6117,14 @@ class Main(QMainWindow):
         QMessageBox.information(self, "Image", "Select an image layer first.")
         return None
 
+    def selected_video(self):
+        it = self.selected()
+        return it if (HAS_VIDEO and isinstance(it, VideoItem)) else None
+
     def edit_image(self):
+        v = self.selected_video()
+        if v is not None:
+            return self.edit_video(v)
         it = self.selected_image()
         if not it or self.is_locked(it):
             return
@@ -5227,6 +6140,9 @@ class Main(QMainWindow):
         if self.crop_state:
             self.end_crop(True)
             return
+        v = self.selected_video()
+        if v is not None:
+            return self.crop_video(v)
         it = self.selected_image()
         if not it or self.is_locked(it):
             return
@@ -5292,6 +6208,8 @@ class Main(QMainWindow):
                 self.scene.removeItem(ov)
             if getattr(it, "cell_ref", None):    # a photo of a grid: hand the crop back to its cell
                 self.finish_cell_crop(it, apply, target if apply else None)
+            if getattr(it, "video_ref", None):   # a video: hand the crop back to the video layer
+                self.finish_video_crop(it, apply, target)
         except RuntimeError:
             pass                                 # the layer was deleted meanwhile
         self.scene.crop_overlay = None
@@ -5551,6 +6469,11 @@ class Main(QMainWindow):
             bg = menu.addMenu("Background Tools")
             self.fill_bg_menu(bg)
             edit.append(bg.menuAction())
+        elif HAS_VIDEO and isinstance(hit, VideoItem):
+            edit += [menu.addAction("Crop Video...", self.crop_image),
+                     menu.addAction("Trim Video Length...", self.trim_video),
+                     menu.addAction("Edit Video (Filters)...", self.edit_image),
+                     menu.addAction("Play / Pause", self.toggle_video)]
         elif isinstance(hit, TextItem):
             edit.append(menu.addAction("Text Options...", self.text_panel))
             for label, key in (("Align Left", "left"), ("Align Center", "center"), ("Align Right", "right"), ("Justify", "justify")):
@@ -5995,19 +6918,101 @@ class Main(QMainWindow):
 
     def add_video(self):
         if not HAS_VIDEO:
-            QMessageBox.warning(self, "Video", "QtMultimedia is not available in this PySide6 install.")
+            QMessageBox.warning(self, "Video", "Video needs OpenCV and numpy:\n\npip install opencv-python numpy")
             return
         f, _ = QFileDialog.getOpenFileName(self, "Add video", "", "Video (" + VID_EXT + ")")
         if f:
             self.scene.add_item(VideoItem(f, None, int(self.scene.pw * 0.8)), self.view_center())
             self.commit()
 
+    def edit_video(self, v):
+        if self.is_locked(v):
+            return
+        if np is None:
+            QMessageBox.warning(self, "Edit video", "Video filters need numpy:\n\npip install numpy")
+            return
+        self.adj_panel = AdjustPanel(self, v)
+        self.adj_panel.setWindowTitle("Edit video")
+        self.adj_panel.show()
+
+    def crop_video(self, v):
+        """Crop a video right on the canvas: same box, snapping and panel as cropping a photo."""
+        if self.is_locked(v):
+            return
+        poster = v.poster()
+        if poster is None:
+            QMessageBox.information(self, "Crop video", "The video is still loading - try again in a moment.")
+            return
+        pm = QPixmap.fromImage(poster)
+        if max(pm.width(), pm.height()) > 1600:
+            pm = pm.scaled(1600, 1600, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        W, H = pm.width(), pm.height()
+        key = "vidcrop-" + uuid.uuid4().hex[:8]
+        self.pixmaps[key] = pm
+        crop = v.crop or [0, 0, 1, 1]
+        proxy = QGraphicsPixmapItem(pm)
+        proxy.setTransformationMode(Qt.SmoothTransformation)
+        proxy.setShapeMode(QGraphicsPixmapItem.BoundingRectShape)
+        proxy.setData(0, key)
+        proxy.setData(6, json.dumps(v.crop))
+        proxy.video_ref = (v, key)
+        self.refresh_image(proxy)                            # shows exactly what the video shows now
+        proxy.setFlags(QGraphicsItem.ItemIsMovable | QGraphicsItem.ItemIsSelectable)
+        proxy.setTransformOriginPoint(proxy.boundingRect().center())
+        proxy.setScale(max(0.02, min(10.0, v.size().width() * v.scale() / max((crop[2] - crop[0]) * W, 1))))
+        proxy.setRotation(v.rotation())
+        proxy.setZValue(v.zValue() + 0.5)
+        self.scene.addItem(proxy)
+        cur = proxy.mapToScene(proxy.boundingRect().center())
+        tgt = v.mapToScene(v.boundingRect().center())
+        proxy.moveBy(tgt.x() - cur.x(), tgt.y() - cur.y())
+        v.setVisible(False)
+        self.scene.clearSelection()
+        proxy.setSelected(True)
+        self.crop_image()
+
+    def finish_video_crop(self, proxy, apply, target):
+        v, key = proxy.video_ref
+        try:
+            if apply:
+                new = None if target is None or target == [0, 0, 1, 1] else list(target)
+                size = proxy.boundingRect().size()           # the kept region, in the same units as the proxy
+                centre = proxy.mapToScene(proxy.boundingRect().center())
+                v.crop = new
+                v.setSize(size)
+                v.setTransformOriginPoint(v.boundingRect().center())
+                v.setScale(proxy.scale())
+                v.setRotation(proxy.rotation())
+                cur = v.mapToScene(v.boundingRect().center())
+                v.moveBy(centre.x() - cur.x(), centre.y() - cur.y())
+                v.refresh()
+            v.setVisible(True)
+            self.scene.removeItem(proxy)
+            self.pixmaps.pop(key, None)
+            v.setSelected(True)
+        except RuntimeError:
+            pass
+
+    def trim_video(self):
+        v = self.selected_video()
+        if v is None:
+            QMessageBox.information(self, "Video", "Select a video layer first.")
+            return
+        if self.is_locked(v):
+            return
+        d = TrimDialog(self, v)
+        if d.exec():
+            v.set_trim(d.result_trim())
+            self.commit()
+        else:
+            v.set_trim(d.old)
+        v.play()
+
     def toggle_video(self):
         if HAS_VIDEO:
             for it in self.content_items():
                 if isinstance(it, VideoItem):
-                    pl = it.player
-                    pl.pause() if pl.playbackState() == QMediaPlayer.PlayingState else pl.play()
+                    it.toggle_play()
 
     def layers_sel(self):
         return [i for i in self.scene.selectedItems() if isinstance(i, LAYERS)]
@@ -6100,108 +7105,321 @@ class Main(QMainWindow):
             self.relayout(it)
             self.commit()
 
-    def export_video(self):
-        """One H.264 .mp4 per slide. Videos are decoded with OpenCV and composited into every frame;
-        writing uses OpenCV's Windows Media Foundation encoder (falls back to mp4v)."""
-        try:
-            import cv2
-            import numpy as np
-        except ImportError:
-            QMessageBox.warning(self, "MP4 export", "MP4 export needs two extra packages:\n\npip install opencv-python numpy")
-            return
+    def prepare_videos(self, vmap):
+        """Read every video on the canvas once: frames, fps, kept range, sound. Returns (infos, fps, frames, error)."""
+        infos = {}
+        for k in sorted(vmap):
+            for v in vmap[k]:
+                if v in infos:
+                    continue
+                cap = cv2.VideoCapture(v.path)
+                n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                fps_v = cap.get(cv2.CAP_PROP_FPS) or 30.0
+                ok = cap.isOpened() and n > 0 and int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0) > 0
+                cap.release()
+                if not ok:
+                    return None, 0, 0, (f"Could not read {Path(v.path).name}. HEVC / H.265 videos may need the Microsoft "
+                                        f"'HEVC Video Extensions' from the Microsoft Store.")
+                a, b = (int(v.trim[0] / 1000.0 * fps_v), int(v.trim[1] / 1000.0 * fps_v)) if v.trim else (0, n)
+                a = min(max(a, 0), n - 1)
+                b = min(max(b, a + 1), n)
+                infos[v] = {"v": v, "n": n, "fps": fps_v, "a": a, "b": b, "audio": probe_audio(FFMPEG, v.path)}
+        fps = max(i["fps"] for i in infos.values())
+        frames = max(1, min(int(round(max((i["b"] - i["a"]) / i["fps"] for i in infos.values()) * fps)), int(fps * 600)))
+        return infos, fps, frames, None
+
+    def render_video_slides(self, folder, ex, vmap, infos, fps, total, progress, base, limits):
+        """Export every slide in vmap as slide_NN.mp4, one slide at a time (one encoder in memory, not many).
+        Returns (number done, error text or None, info text)."""
         sc = self.scene
-        vids = [i for i in self.content_items() if HAS_VIDEO and isinstance(i, VideoItem)]
-        if not vids:
-            QMessageBox.information(self, "MP4 export", "Add a video layer first (Insert > Video).\nFor photos only, use Export Slides.")
-            return
-        folder = QFileDialog.getExistingDirectory(self, "Export MP4 slides to folder")
-        if not folder:
-            return
-        fps, caps, writers, proxies, dlg = 30, [], [], [], None
+        fs = fps_str(fps)
+        OW, OH = int(sc.pw * ex) // 2 * 2, int(sc.ph * ex) // 2 * 2
+        auds = {k: [infos[v] for v in vmap[k] if infos[v]["audio"]] for k in vmap}
+        gpu = bool(getattr(limits, "gpu", False))
+        level, log = preflight_encoder(FFMPEG, next((a for a in auds.values() if a), []), fs, folder, gpu, (OW, OH))
+        if level is None:
+            return 0, ("The video encoder could not start.\n\nffmpeg: " + str(FFMPEG) + "\n\n" + "\n".join(log)), ""
+        all_vids = list(infos)
         old_guides = sc.show_guides
         sc.clearSelection()
         sc.exporting, sc.show_guides = True, False
-        for v in vids:
-            v.player.pause()
+        for v in all_vids:
+            v.pause()
             v.setVisible(False)
+        slides = sorted(vmap)
+        done_n, err, canceled = 0, None, False
         try:
-            for v in vids:
-                cap = cv2.VideoCapture(v.path)
-                n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-                caps.append({"cap": cap, "n": n, "fps": cap.get(cv2.CAP_PROP_FPS) or 30.0, "last": -2})
-                if not cap.isOpened() or n <= 0:
-                    raise RuntimeError(f"Could not decode {Path(v.path).name}. HEVC may need the Microsoft 'HEVC Video Extensions'.")
-            total = max(1, min(int(max(c["n"] / c["fps"] for c in caps) * fps), fps * 120))
-            fourcc = cv2.VideoWriter_fourcc(*"H264")
-            for k in range(sc.n * sc.rows):
-                path = str(Path(folder) / f"slide_{k + 1:02d}.mp4")
-                w = cv2.VideoWriter(path, cv2.CAP_MSMF, fourcc, fps, (sc.pw, sc.ph))
-                if not w.isOpened():
-                    w = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (sc.pw, sc.ph))
-                if not w.isOpened():
-                    raise RuntimeError("No MP4 encoder could be opened (try even slide sizes like 1080 x 1350).")
-                writers.append(w)
-            for v in vids:   # stand-in layers that carry the current decoded frame
-                pr = QGraphicsPixmapItem()
-                c = v.boundingRect().center()
-                pr.setTransformOriginPoint(c)
-                pr.setPos(v.pos())
-                pr.setScale(v.scale())
-                pr.setRotation(v.rotation())
-                pr.setOpacity(v.opacity())
-                pr.setZValue(v.zValue())
-                sc.addItem(pr)
-                proxies.append(pr)
-            dlg = QProgressDialog("Rendering frames...", "Cancel", 0, total, self)
-            dlg.setWindowModality(Qt.WindowModal)
-            img = QImage(sc.pw, sc.ph, QImage.Format_RGB32)
-            for fi in range(total):
-                if dlg.wasCanceled():
+            for si, k in enumerate(slides):
+                if progress.canceled():
+                    canceled = True
                     break
-                for v, c, pr in zip(vids, caps, proxies):
-                    idx = int(fi / fps * c["fps"]) % c["n"]
-                    if idx != c["last"]:
-                        if idx != c["last"] + 1:
-                            c["cap"].set(cv2.CAP_PROP_POS_FRAMES, idx)
-                        ok, fr = c["cap"].read()
-                        if ok:
-                            rgb = cv2.cvtColor(fr, cv2.COLOR_BGR2RGB)
-                            h_, w_ = rgb.shape[:2]
-                            q = QImage(rgb.data, w_, h_, rgb.strides[0], QImage.Format_RGB888).copy()
-                            pr.setPixmap(QPixmap.fromImage(q.scaled(int(v.size().width()), int(v.size().height()),
-                                                                    Qt.IgnoreAspectRatio, Qt.SmoothTransformation)))
-                        c["last"] = idx
-                for k, w in enumerate(writers):
-                    img.fill(sc.bg)
-                    p = QPainter(img)
-                    p.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform | QPainter.TextAntialiasing)
-                    sc.render(p, QRectF(0, 0, sc.pw, sc.ph),
-                              QRectF((k % sc.n) * sc.pw, (k // sc.n) * sc.ph, sc.pw, sc.ph))
-                    p.end()
-                    a = np.frombuffer(img.constBits(), np.uint8).reshape(sc.ph, img.bytesPerLine() // 4, 4)[:, :sc.pw, :3]
-                    w.write(np.ascontiguousarray(a))
-                dlg.setValue(fi + 1)
-                QApplication.processEvents()
-            done = not dlg.wasCanceled()
-        except Exception as ex:
-            done = False
-            QMessageBox.critical(self, "MP4 export failed", str(ex))
+                out = Path(folder) / f"slide_{k + 1:02d}.mp4"
+                ef = tempfile.TemporaryFile()
+                pc = run_hidden(encoder_cmd(FFMPEG, OW, OH, fs, auds[k], out, level, limits.threads),
+                                low_priority=limits.low_priority, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=ef)
+                caps, proxies, pool = {}, [], None
+                try:
+                    for v in vmap[k]:
+                        i = dict(infos[v])
+                        i["cap"], i["last"] = cv2.VideoCapture(v.path), -2
+                        tw, th = max(1, int(round(v.size().width() * ex))), max(1, int(round(v.size().height() * ex)))
+                        i["tw"], i["th"] = tw, th
+                        pr = QGraphicsPixmapItem(QPixmap(tw, th))
+                        pr.setTransformOriginPoint(QPointF(tw / 2, th / 2))
+                        pr.setScale(v.scale() * v.size().width() / tw)
+                        pr.setRotation(v.rotation())
+                        pr.setOpacity(v.opacity())
+                        pr.setZValue(v.zValue())
+                        pr.setPos(v.pos())
+                        sc.addItem(pr)
+                        cur = pr.mapToScene(pr.boundingRect().center())
+                        tgt = v.mapToScene(v.boundingRect().center())
+                        pr.moveBy(tgt.x() - cur.x(), tgt.y() - cur.y())
+                        i["pr"] = pr
+                        proxies.append(pr)
+                        caps[v] = i
+                    img = QImage(OW, OH, QImage.Format_RGB32)
+                    nbytes = OW * OH * 4
+                    # frames are decoded in order here, but the filters (the slow part) run on several worker threads at once,
+                    # a few frames ahead of the one being drawn; the result is identical to doing it one by one.
+                    nw = video_workers(limits, [(i["tw"], i["th"]) for i in caps.values()], any(i["v"].adj() for i in caps.values()))
+                    pool = ThreadPoolExecutor(nw)
+                    depth = nw + 2
+                    for i in caps.values():
+                        i.update(nxt=0, sub_idx=-2, sub_fut=None, futs={}, shown=None, adj=i["v"].adj())
+                    for fi in range(total):
+                        for i in caps.values():
+                            while i["nxt"] < min(total, fi + depth):
+                                f2 = i["nxt"]
+                                idx = i["a"] + int(f2 / fps * i["fps"]) % (i["b"] - i["a"])
+                                if idx != i["sub_idx"]:
+                                    if idx != i["sub_idx"] + 1:
+                                        i["cap"].set(cv2.CAP_PROP_POS_FRAMES, idx)
+                                    ok, fr = i["cap"].read()
+                                    if ok:
+                                        i["sub_fut"] = pool.submit(video_frame_image, cv2, fr, i["v"].crop, i["adj"], i["tw"], i["th"])
+                                    i["sub_idx"] = idx
+                                i["futs"][f2] = i["sub_fut"]
+                                i["nxt"] += 1
+                            fut = i["futs"].pop(fi)
+                            if fut is not None and fut is not i["shown"]:
+                                i["pr"].setPixmap(QPixmap.fromImage(fut.result()))
+                                i["shown"] = fut
+                        img.fill(sc.bg)
+                        p = QPainter(img)
+                        p.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform | QPainter.TextAntialiasing)
+                        sc.render(p, QRectF(0, 0, OW, OH), slide_rect(sc, k))
+                        p.end()
+                        data = memoryview(img.constBits())[:nbytes]
+                        try:
+                            for pos in range(0, nbytes, 1 << 20):            # small chunks: kind to Windows pipes
+                                pc.stdin.write(data[pos:pos + (1 << 20)])
+                            pc.stdin.flush()
+                        except (OSError, ValueError) as e:
+                            ef.seek(0)
+                            why = ef.read().decode(errors="replace").strip()[-700:]
+                            raise RuntimeError(f"The video encoder stopped while writing slide {k + 1} ({e}).\n\n{why or 'No message from the encoder.'}")
+                        if fi % 3 == 0 or fi == total - 1:
+                            progress.update(base + si * total + fi + 1, f"Slide {k + 1} (video): frame {fi + 1} of {total}   "
+                                                                         f"[slide {si + 1} of {len(slides)} with video]")
+                            if progress.canceled():
+                                canceled = True
+                                break
+                    try:
+                        pc.stdin.close()
+                    except OSError:
+                        pass
+                    if canceled:
+                        pc.kill()
+                        break
+                    progress.update(base + (si + 1) * total, f"Slide {k + 1}: finishing the video file...")
+                    if pc.wait() != 0:
+                        ef.seek(0)
+                        raise RuntimeError("The video encoder reported an error:\n" + ef.read().decode(errors="replace")[-700:])
+                    done_n += 1
+                finally:
+                    if pc.poll() is None:
+                        pc.kill()
+                    if pool is not None:
+                        pool.shutdown(wait=True, cancel_futures=True)
+                    for i in caps.values():
+                        i["cap"].release()
+                    for pr in proxies:
+                        sc.removeItem(pr)
+                    ef.close()
+                    img = None
+                    gc.collect()
+        except Exception as e:
+            err = str(e)
         finally:
-            for w in writers:
-                w.release()
-            for c in caps:
-                c["cap"].release()
-            for pr in proxies:
-                sc.removeItem(pr)
-            for v in vids:
+            for v in all_vids:
                 v.setVisible(True)
-                v.player.play()
+                v.play()
             sc.exporting, sc.show_guides = False, old_guides
             sc.update()
-            if dlg:
-                dlg.close()
-        if done:
-            QMessageBox.information(self, "Done", f"Exported {len(writers)} MP4 slides to:\n{folder}\n\n(Video only - no audio.)")
+        if canceled and not err:
+            err = "Export cancelled."
+        sound = "original audio kept" if any(i["audio"] for i in infos.values()) else "no audio in the source video"
+        if level == -1:
+            quality, note = "high-quality H.264 (graphics card encoder)", ""
+        else:
+            quality = "near-lossless H.264"
+            note = "" if level == 0 else " (compatibility mode: this PC's encoder could not use the best settings)"
+            if gpu:
+                note += " (the graphics card encoder was not available, the processor was used)"
+        return done_n, err, f"videos {OW} x {OH} px, {fps:.3f} fps (same as the source), {quality}, {sound}{note}"
+
+    def export_images(self, slides, fmt, scale, folder, progress, base, per_slide, limits):
+        """Photos / text slides: render on this thread, encode on a second thread, so the window and the progress bar
+        keep moving and only about two slides are ever in memory. Returns (number done, error text or None)."""
+        sc = self.scene
+        W, H = int(sc.pw * scale), int(sc.ph * scale)
+        q = queue.Queue(maxsize=1)
+        state = {"done": 0, "err": None, "busy": None}
+
+        def worker():
+            while True:
+                item = q.get()
+                if item is None:
+                    return
+                i, img = item
+                state["busy"] = i
+                if state["err"] is None:
+                    state["err"] = save_image_hq(img, Path(folder) / f"slide_{i + 1:02d}", fmt)
+                    if state["err"] is None:
+                        state["done"] += 1
+                state["busy"] = None
+                del img
+
+        th = threading.Thread(target=worker, daemon=True)
+        th.start()
+        sc.clearSelection()
+        old_guides = sc.show_guides
+        sc.exporting, sc.show_guides = True, False
+        canceled = False
+        try:
+            for n, i in enumerate(slides):
+                if progress.canceled() or state["err"]:
+                    canceled = bool(progress.canceled())
+                    break
+                progress.update(base + n * per_slide + per_slide * 0.3, f"Slide {i + 1}: drawing {W} x {H} px...")
+                img = QImage(W, H, QImage.Format_RGB32)
+                img.fill(sc.bg)
+                p = QPainter(img)
+                p.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform | QPainter.TextAntialiasing)
+                sc.render(p, QRectF(0, 0, W, H), slide_rect(sc, i))
+                p.end()
+                progress.update(base + n * per_slide + per_slide * 0.5, f"Slide {i + 1}: saving as {fmt.upper()}...")
+                while True:                                    # hand over (waits while the previous slide is still saving)
+                    try:
+                        q.put((i, img), timeout=0.05)
+                        break
+                    except queue.Full:
+                        progress.update(base + n * per_slide + per_slide * 0.5, f"Slide {i + 1}: saving as {fmt.upper()}...")
+                        if progress.canceled():
+                            break
+                img = None
+            while True:                                        # last slide: wait for it, bar stays alive
+                try:
+                    q.put(None, timeout=0.05)
+                    break
+                except queue.Full:
+                    progress.update(base + len(slides) * per_slide * 0.9, "Saving the last image slide...")
+            while th.is_alive():
+                th.join(0.05)
+                progress.update(base + len(slides) * per_slide * 0.97, "Saving the last image slide...")
+        finally:
+            sc.exporting, sc.show_guides = False, old_guides
+            sc.update()
+            gc.collect()
+        err = state["err"] or ("Export cancelled." if canceled else None)
+        return state["done"], err
+
+    def export(self):
+        """One export for everything: slides with video become MP4, the others are saved in the chosen image format.
+        Files are numbered in slide order (slide_01, slide_02, ...), whatever their type. One progress bar, and the PC
+        stays usable (lower priority, only part of the CPU cores)."""
+        sc = self.scene
+        if self.crop_state:
+            self.end_crop(True)
+        vmap = video_slide_map(sc)
+        if vmap and not need_video_tools(self):
+            return
+        auto = self.auto_export_scale()
+        if vmap:
+            need = 1.0
+            for v in {v for l in vmap.values() for v in l}:
+                try:
+                    c = v.crop or [0, 0, 1, 1]
+                    need = max(need, (c[2] - c[0]) * (v.native[0] or 0) / max(v.size().width() * v.scale(), 1))
+                except Exception:
+                    pass
+            auto = int(min(4, max(auto, math.ceil(need - 0.05))))
+        d = ExportDialog(self, auto, len({v for l in vmap.values() for v in l}), sorted(vmap))
+        if not d.exec():
+            return
+        fmt, scale, folder = d.fmt, d.scale, d.folder
+        if not folder:
+            return
+        # ---- memory check: never start something the PC cannot hold
+        avail = available_ram_mb()
+        while avail:
+            need = est_export_mb(fmt, int(sc.pw * scale), int(sc.ph * scale)) + 1200
+            if vmap:
+                vk = video_scale(scale)
+                need = max(need, est_video_mb(int(sc.pw * vk), int(sc.ph * vk)) + 1200)
+            if need <= avail * 0.6 or scale <= 1:
+                break
+            box = QMessageBox(self)
+            box.setWindowTitle("Not enough free memory")
+            box.setText(f"Exporting at {scale}x needs about {need / 1024:.1f} GB, but only {avail / 1024:.1f} GB of memory is free.\n\n"
+                        f"Exporting anyway could make your computer very slow.")
+            lower = box.addButton(f"Use {scale - 1}x instead", QMessageBox.AcceptRole)
+            go = box.addButton("Export anyway", QMessageBox.DestructiveRole)
+            box.addButton("Cancel", QMessageBox.RejectRole)
+            box.exec()
+            c = box.clickedButton()
+            if c is lower:
+                scale -= 1
+            elif c is go:
+                break
+            else:
+                return
+        img_slides = [i for i in range(sc.n * sc.rows) if i not in vmap]
+        infos, fps, frames = {}, 30.0, 0
+        if vmap:
+            infos, fps, frames, perr = self.prepare_videos(vmap)
+            if perr:
+                QMessageBox.warning(self, "Export", perr)
+                return
+        per_slide = 25.0
+        total_units = len(img_slides) * per_slide + len(vmap) * frames
+        done_img, err, done_vid, verr, vinfo = 0, None, 0, None, ""
+        limits = ExportLimits(d.perf)
+        limits.gpu = getattr(d, "gpu", False)
+        progress = ExportProgress(self, total_units)
+        self.view.setUpdatesEnabled(False)           # the editor view behind the progress window does not need to redraw
+        try:
+            with limits:
+                if img_slides:
+                    done_img, err = self.export_images(img_slides, fmt, scale, folder, progress, 0, per_slide, limits)
+                if not err and vmap:
+                    done_vid, verr, vinfo = self.render_video_slides(folder, video_scale(scale), vmap, infos, fps, frames, progress,
+                                                                    len(img_slides) * per_slide, limits)
+        finally:
+            self.view.setUpdatesEnabled(True)
+            progress.close()
+            gc.collect()
+        if err or verr:
+            QMessageBox.warning(self, "Export", err or ("Video export failed:\n\n" + verr))
+        if done_img or done_vid:
+            lines = [f"Exported {done_img + done_vid} slide(s) to:\n{folder}\n"]
+            if done_img:
+                lines.append(f"{done_img} image slide(s): {int(sc.pw * scale)} x {int(sc.ph * scale)} px, {fmt}, no quality loss")
+            if done_vid:
+                lines.append(f"{done_vid} video slide(s): {vinfo}")
+            lines.append("Files are numbered in slide order: slide_01, slide_02, ...")
+            QMessageBox.information(self, "Done", "\n".join(lines))
 
     def duplicate(self):
         top = max([i.zValue() for i in self.content_items()] + [0])
@@ -6348,44 +7566,6 @@ class Main(QMainWindow):
             except RuntimeError:
                 pass
         return int(max(2, min(4, math.ceil(need))))
-
-    def export(self):
-        d = ExportDialog(self, self.auto_export_scale())
-        if not d.exec():
-            return
-        fmt, scale, folder = d.fmt, d.scale, d.folder
-        if not folder:
-            return
-        sc = self.scene
-        sc.clearSelection()
-        sc.exporting = True
-        sc.show_guides = False
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        done, err = 0, None
-        try:
-            W, H = int(sc.pw * scale), int(sc.ph * scale)
-            for i in range(sc.n * sc.rows):
-                img = QImage(W, H, QImage.Format_RGB32)
-                img.fill(sc.bg)
-                p = QPainter(img)
-                p.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform | QPainter.TextAntialiasing)
-                sc.render(p, QRectF(0, 0, W, H), QRectF((i % sc.n) * sc.pw, (i // sc.n) * sc.ph, sc.pw, sc.ph))
-                p.end()
-                err = save_image_hq(img, Path(folder) / f"slide_{i + 1:02d}", fmt)
-                if err:
-                    break
-                done += 1
-                QApplication.processEvents()
-        finally:
-            QApplication.restoreOverrideCursor()
-            sc.exporting = False
-            sc.show_guides = True
-            sc.update()
-        if err:
-            QMessageBox.warning(self, "Export", err)
-        if done:
-            QMessageBox.information(self, "Done", f"Exported {done} slide(s) at {int(sc.pw * scale)} x {int(sc.ph * scale)} px "
-                                                  f"({fmt}, no quality loss) to:\n{folder}")
 
 
 # ---------------------------------------------------------------- splash screen

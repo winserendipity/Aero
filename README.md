@@ -48,7 +48,7 @@
 
 **Aero** is a desktop photo editor made for building **seamless carousel albums**: the swipeable multi-photo posts on Instagram, Facebook and Threads where one picture, one design or one story flows across several slides.
 
-**No Paywall. No Subscription. No Account Needed. No Watermarks. Just unleash your creativity**
+**No Paywall. No Subscription. No Account Needed. No Watermarks. Just unleash your creativity.**
 
 You work on one wide canvas that is cut into slides. A photo, a line of text or a shape can sit across the cut between two slides, and when the post is swiped it lines up perfectly. Aero adds a full photo-editing toolkit on top: film emulation, colour grading, cropping, background tools, collage grids and templates.
 
@@ -361,4 +361,4 @@ Aero is at **version 1.0.0**. Current focus:
 
 Created by **Winserendipity**.
 
-© 2026 Winserendipity. **All rights reserved.** Aero is distributed as a compiled Windows application. The source code is not public and may not be copied, redistributed or modified without the author's permission.
+© 2026 Winserendipity. **All rights reserved.** Aero is distributed as a compiled Windows application. The source code is open; to collaborate with others, please ask the author's permission.

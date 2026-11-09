@@ -6,14 +6,18 @@
 </p>
 
 <p align="center">
-  <img alt="Status" src="https://img.shields.io/badge/status-beta-orange">
-  <img alt="Version" src="https://img.shields.io/badge/version-0.0.1--beta-blue">
+  <img alt="Status" src="https://img.shields.io/badge/status-stable-brightgreen">
+  <img alt="Version" src="https://img.shields.io/badge/version-1.0.0-blue">
   <img alt="Platform" src="https://img.shields.io/badge/platform-Windows%2011-0078D4">
   <img alt="Language" src="https://img.shields.io/badge/language-Python-3776AB">
   <img alt="UI" src="https://img.shields.io/badge/UI-PySide6%20(Qt)-41CD52">
 </p>
 
-> **Beta notice:** Aero is under active development. This is an early beta for testing and feedback, **not for general deployment**. Expect bugs and missing features, save often, and keep a copy of your original photos.
+> **Aero 1.0.0 is the first public release.** See [what's new](RELEASE_NOTES.md), and keep a copy of your original photos as with any editor.
+
+<p align="center">
+  <img src="docs/screenshots/editor.png" alt="Aero editor: a panorama running across four slides" width="900">
+</p>
 
 ---
 
@@ -24,14 +28,15 @@
 3. [Platform and compatibility](#platform-and-compatibility)
 4. [Built with](#built-with)
 5. [System requirements](#system-requirements)
-6. [How Aero helps photographers and creators](#how-aero-helps-photographers-and-creators)
-6. [Features](#features)
-7. [Getting started](#getting-started)
-8. [Documentation](#documentation)
-9. [Known limitations (beta)](#known-limitations-beta)
-10. [Feedback and bug reports](#feedback-and-bug-reports)
-11. [Project status and roadmap](#project-status-and-roadmap)
-12. [Credits and license](#credits-and-license)
+6. [Screenshots](#screenshots)
+7. [How Aero helps photographers and creators](#how-aero-helps-photographers-and-creators)
+8. [Features](#features)
+9. [Getting started](#getting-started)
+10. [Documentation](#documentation)
+11. [Known limitations](#known-limitations)
+12. [Feedback and bug reports](#feedback-and-bug-reports)
+13. [Project status and roadmap](#project-status-and-roadmap)
+14. [Credits and license](#credits-and-license)
 
 ---
 
@@ -53,7 +58,7 @@ Designing a carousel usually means juggling a photo editor, a design tool and a 
 
 | Platform | Status |
 | --- | --- |
-| **Windows 11 (64-bit)** | Supported. Beta installer available. |
+| **Windows 11 (64-bit)** | Supported. Installer on the Releases page. |
 | Windows 10 | Not officially tested. |
 | macOS / Linux | Not available yet. |
 | Mobile (iOS / Android) | Not available. |
@@ -89,6 +94,17 @@ Aero is built and tested for Windows 11 desktop. It does not need a GPU or an in
 - Video export is near-lossless, so files are large and rendering takes time. Plan free disk space accordingly. Video slides are exported at up to 2x (for example 2160 x 2700 px), even when images use a higher resolution, which keeps the encoder to roughly 1 GB of memory.
 - Some videos (HEVC / H.265) may need the Microsoft "HEVC Video Extensions" from the Microsoft Store.
 - No internet connection is needed to use Aero.
+
+---
+
+## Screenshots
+
+| | |
+| --- | --- |
+| **Start screen**<br><img src="docs/screenshots/start.png" width="440"> | **New project**<br><img src="docs/screenshots/new_project.png" width="440"> |
+| **Templates**<br><img src="docs/screenshots/templates.png" width="440"> | **Collage grids**<br><img src="docs/screenshots/grids.png" width="440"> |
+| **Text**<br><img src="docs/screenshots/text.png" width="440"> | **Settings**<br><img src="docs/screenshots/settings.png" width="440"> |
+| **Trim video**<br><img src="docs/screenshots/trim.png" width="440"> | **Export**<br><img src="docs/screenshots/export.png" width="440"> |
 
 ---
 
@@ -200,9 +216,10 @@ More than **230 looks**, searchable and grouped by category:
 ### Video
 
 - **Add Video** (next to **Add Image**, in the toolbar and the Insert menu) puts a video layer on the canvas; it plays in the editor.
-- Right-click a video for **Crop Video**, **Trim Video Length**, **Edit Video (Filters)** and **Play / Pause**.
+- Right-click a video for **Crop Video**, **Trim Video Length**, **Edit Video (Filters)**, **Play / Pause**, **Mute this video** and **Sound only from this video**.
 - **Crop Video:** crop on the spot with the same box, snapping and panel as photos.
 - **Trim Video Length:** keep only the part of the clip you want, with start and end sliders.
+- **Mute:** every video has a **Sound on / Muted** button in the options bar (also in the right-click menu). A muted video adds no sound to the exported slide, and Layers shows "Muted" next to it. When a slide has several videos, use **Sound only from this video** to keep one sound and mute the others on that slide. Videos play silently inside the editor, so the setting only affects exported files. The setting is saved with the project.
 - **Edit Video (Filters):** every Edit Image option works on video: all 230+ filters and film looks, plus exposure, contrast, colour, grain and more.
 - **Export:** one Export command saves everything. Slides that contain video are exported as MP4 (full quality, original frame rate and sound; a video can run across several slides), and the other slides as images. All files are numbered in slide order.
 
@@ -213,9 +230,9 @@ The **Export** dialog is built around keeping every detail:
 - **Formats:** PNG (lossless), JPEG (maximum quality), JFIF (maximum quality), TIFF (lossless), WebP (lossless), HEIC (maximum quality), HEIF (maximum quality) and BMP (uncompressed).
 - **Resolution:** **Best detail** (automatic 2× to 4×; HEIC / HEIF stop at 2× because they are very memory-hungry) or a fixed 1× to 4×. Slides with video are always limited to 2× (larger video needs many GB of memory and plays on almost no device).
 - **Video encoder:** *Best quality - processor* (default, near-lossless H.264) or *Much faster - graphics card* (NVIDIA NVENC, high quality, hardly any processor use). If the graphics card cannot do it, Aero switches to the processor automatically.
-- **Speed:** video filters are computed on several threads at once (a few frames ahead), and the encoder is tuned for speed, so filtered videos export several times faster than before.
+- **Speed:** video filters are computed on several threads at once (a few frames ahead), the colour maths of the filters is much faster, film grain and vignette are calculated once instead of for every frame, and a clip with fewer real pixels than the export size (for example 1080p saved at 2x) is filtered at its real size and enlarged afterwards. Filtered videos export several times faster than before.
 - **Progress bar:** one progress window for the whole export, with the current slide, overall percentage and time left. You can cancel at any time.
-- **Computer load:** *Balanced* (default) uses about half of your CPU cores at lower priority so the PC stays usable; *Gentle* uses 2 cores; *Fast* uses everything. Aero also checks free memory first and offers a lower resolution if the export would not fit.
+- **Computer load:** *Balanced* (default) uses about half of your CPU cores at lower priority so the PC stays usable; *Gentle* uses 2 cores; *Fast* uses everything. On Windows, Balanced and Gentle also put a hard ceiling on total CPU use (about 50% and 2 cores' worth), so the processor and its temperature stay down even while saving HEIC or other large images. The message at the end of an export shows which limits were applied. Aero also checks free memory first and offers a lower resolution if the export would not fit.
 - Text, shapes and grid photos are rendered at the export resolution, so fonts stay crisp.
 - Each slide is saved as its own numbered file (`slide_01`, `slide_02`, ...) in the folder you choose. Slides with video become `.mp4` files in the same folder.
 - Transparent areas are kept in PNG, TIFF and WebP.
@@ -230,6 +247,11 @@ The **Export** dialog is built around keeping every detail:
 ### Interface and settings
 
 - Modern **dark and light themes** with an adjustable **accent colour**.
+- **Studio layout:** a slim tool rail on the left, a tool options bar under the menu, the canvas in the middle, and **Properties** and **Layers** docked on the right. Panels sit flush against each other so the canvas stays the focus.
+- **Floating view bar** at the bottom of the canvas: go to the previous or next slide, zoom in and out, and fit the whole project.
+- **Properties** names what is selected (Image, Text, Shape, Video, Grid or Canvas) and groups its settings in collapsible sections.
+- **Layers** can be filtered (All, Photos, Video, Text, Shapes) or searched, and its footer has Bring to front, Send to back, Duplicate and Delete.
+- The **start screen** follows the same design: a full-height sidebar, a highlighted New project card, a four-step guide, recent projects and templates.
 - **Settings** with General (language), Appearance, Version and About (system information) tabs.
 - Language list: English, Filipino, Español, Français, Deutsch, Português, Italiano, 日本語, 한국어 and 中文 (简体). *(The language option is present; full translation of the interface is still in progress.)*
 - Right-click context menus on every layer type.
@@ -253,11 +275,11 @@ The **Export** dialog is built around keeping every detail:
 
 ## Getting started
 
-### Install the Windows beta
+### Install on Windows
 
-1. Download **`Aero-Setup-0.0.1-beta.exe`** from the [Releases](../../releases) page.
+1. Download **`Aero-Setup-1.0.0.exe`** from the [Releases](../../releases) page.
 2. Run the installer and follow the steps.
-3. Windows may show a *"Windows protected your PC"* message because the beta installer is not code-signed. Click **More info**, then **Run anyway**.
+3. Windows may show a *"Windows protected your PC"* message because the installer is not code-signed. Click **More info**, then **Run anyway**.
 4. Launch **Aero** from the Start menu or the desktop shortcut.
 
 Aero runs as a normal Windows app: you do not need to install Python or anything else. Requires Windows 11 (64-bit).
@@ -302,17 +324,17 @@ Open **Templates**, filter by category, select one and click **Use Template**. R
 
 ---
 
-## Known limitations (beta)
+## Known limitations
 
 - Windows 11 only for now.
-- The beta installer is unsigned, so SmartScreen shows a warning.
+- The installer is unsigned, so SmartScreen shows a warning.
 - Interface translation for the non-English languages is still in progress.
 - Very large photos with many heavy filters can be slow to preview on older computers.
-- Expect rough edges: this is the first beta.
+- Videos play without sound inside the editor; sound is added when you export.
 
 ## Feedback and bug reports
 
-Beta testers are very welcome. Please [open an issue](../../issues) and include:
+Bug reports are very welcome. Please [open an issue](../../issues) and include:
 
 - What you did right before the problem happened.
 - What you expected, and what happened instead.
@@ -323,9 +345,9 @@ Feature ideas are welcome too.
 
 ## Project status and roadmap
 
-Aero is **in beta (0.0.1)**. Current focus:
+Aero is at **version 1.0.0**. Current focus:
 
-- Finding and fixing bugs reported by testers.
+- Fixing bugs reported by users.
 - Improving performance and the editing workflow.
 - Adding more creator features based on feedback.
 
@@ -333,4 +355,4 @@ Aero is **in beta (0.0.1)**. Current focus:
 
 Created by **Winserendipity**.
 
-© 2026 Winserendipity. **All rights reserved.** Aero is distributed as a compiled Windows application for beta testing. The source code is not public and may not be copied, redistributed or modified without the author's permission.
+© 2026 Winserendipity. **All rights reserved.** Aero is distributed as a compiled Windows application. The source code is open and to collaborate with others, please ask the author's permission.

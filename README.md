@@ -1,3 +1,8 @@
+[README.md](https://github.com/user-attachments/files/34578845/README.md)
+<p align="center">
+  <img src="assets/aero_icon_256.png" alt="Aero logo" width="140">
+</p>
+
 <h1 align="center">Aero</h1>
 
 <p align="center">
@@ -355,4 +360,4 @@ Aero is at **version 1.0.0**. Current focus:
 
 Created by **Winserendipity**.
 
-© 2026 Winserendipity. **All rights reserved.** Aero is distributed as a compiled Windows application. The source code is open and to collaborate with others, please ask the author's permission.
+© 2026 Winserendipity. **All rights reserved.** Aero is distributed as a compiled Windows application. The source code is open; to collaborate with others, please ask the author's permission.

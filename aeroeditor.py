@@ -1,23 +1,26 @@
 """
-Aero (beta) - a seamless carousel editor for Instagram / Facebook albums, for desktop.
+Aero - a seamless carousel editor for Instagram / Facebook albums, for desktop.
 Run:  pip install PySide6 numpy   then   python aeroeditor.py
 Optional: pip install rembg (AI background removal), pillow pillow-heif (iPhone HEIC photos).
 """
 import os, sys, json, base64, uuid, math, random, hashlib, time, shutil, subprocess, tempfile, threading, weakref, atexit, queue, gc
+for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):     # numpy's helper libraries otherwise spin on every core
+    os.environ.setdefault(_v, str(max(1, min(4, (os.cpu_count() or 4) // 3))))
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from PySide6.QtGui import QCursor
-from PySide6.QtCore import QThread, QObject, Signal, Slot, QEventLoop, QElapsedTimer, QPoint, Qt, QRectF, QPointF, QSizeF, QUrl, QBuffer, QIODevice, QSettings, QSize, QTimer, QVariantAnimation, QEasingCurve, QStandardPaths
+from PySide6.QtCore import QEvent, QThread, QObject, Signal, Slot, QEventLoop, QElapsedTimer, QPoint, Qt, QRectF, QPointF, QSizeF, QUrl, QBuffer, QIODevice, QSettings, QSize, QTimer, QVariantAnimation, QEasingCurve, QStandardPaths
 from PySide6.QtGui import (QColor, QPainter, QPen, QPixmap, QImage, QKeySequence,
                            QAction, QFont, QPolygonF, QLinearGradient, QBrush, QImageReader, QTransform, QIcon,
                            QPainterPath, QPalette, QTextCursor, QTextBlockFormat, QTextCharFormat, QRadialGradient, QPainterPathStroker, QFontMetricsF)
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QGraphicsScene, QGraphicsView, QGraphicsPixmapItem,
-    QGraphicsTextItem, QToolBar, QFileDialog, QColorDialog, QFontDialog, QSpinBox,
+    QGraphicsTextItem, QToolBar, QFileDialog, QSizePolicy, QColorDialog, QFontDialog, QSpinBox,
     QGraphicsItem, QInputDialog, QProgressDialog, QDialog, QTabWidget, QGridLayout, QPushButton,
     QListWidget, QListWidgetItem, QAbstractItemView, QDialogButtonBox, QFormLayout, QComboBox, QLabel, QSlider, QDoubleSpinBox, QWidget, QVBoxLayout, QDockWidget, QMessageBox, QScrollArea, QToolButton, QMenu,
     QStyleOptionGraphicsItem, QCheckBox, QGraphicsDropShadowEffect, QHBoxLayout, QLineEdit, QRadioButton, QStackedWidget, QFrame,
+    QStyledItemDelegate, QStyle, QButtonGroup, QFontComboBox, QMenuBar,
 )
 
 try:
@@ -731,8 +734,9 @@ if HAS_VIDEO:
         """Video layer. Plays silently in the editor; shows the cropped part with Edit Image filters applied live.
         crop = [l, t, r, b] fractions of the frame; trim = (start_ms, end_ms) part of the clip that is kept;
         data(5) = Edit Image settings (same as photos)."""
-        def __init__(self, path, size=None, fit_w=864, crop=None, adj=None, trim=None):
+        def __init__(self, path, size=None, fit_w=864, crop=None, adj=None, trim=None, muted=False):
             super().__init__()
+            self.muted = bool(muted)             # True = this video adds no sound to the exported slide
             self.path, self.fit_w = path, (fit_w if size is None else None)
             self._size = QSizeF(size or QSizeF(640, 360))
             self.crop, self.trim = crop, (tuple(trim) if trim else None)
@@ -880,6 +884,17 @@ class Canvas(QGraphicsScene):
 
     def drawBackground(self, p, rect):
         p.fillRect(rect, PASTEBOARD)
+        if not self.exporting:                       # soft dot grid on the workspace (like design tools), zoom aware
+            px = self.px()
+            step = 24.0 * px
+            sp = 20.0 * 2 ** math.ceil(math.log2(max(step / 20.0, 0.05)))
+            x0, y0 = math.floor(rect.left() / sp) * sp, math.floor(rect.top() / sp) * sp
+            nx, ny = int(rect.width() / sp) + 2, int(rect.height() / sp) + 2
+            if 0 < nx * ny < 12000:
+                pen = QPen(UI_DOT, 1.6 * px)
+                pen.setCapStyle(Qt.RoundCap)
+                p.setPen(pen)
+                p.drawPoints(QPolygonF([QPointF(x0 + i * sp, y0 + j * sp) for j in range(ny) for i in range(nx)]))
         r = self.canvas_rect()
         if self.bg_mode == "gradient":
             a = math.radians(self.bg_angle)
@@ -968,6 +983,14 @@ class Canvas(QGraphicsScene):
             pen.setCosmetic(True)
             p.setPen(pen)
             p.drawRect(self.canvas_rect())
+        px = self.px()                                # slide names above each slide
+        f = QFont(p.font())
+        f.setPixelSize(max(1, int(round(12 * px))))
+        f.setWeight(QFont.DemiBold)
+        p.setFont(f)
+        p.setPen(UI_LABEL)
+        for k in range(self.n * self.rows):
+            p.drawText(QPointF((k % self.n) * self.pw + 2 * px, (k // self.n) * self.ph - 9 * px), f"Slide {k + 1}")
         if self.snap_lines:
             pen = QPen(QColor(0, 220, 200), 2)
             pen.setCosmetic(True)
@@ -1230,12 +1253,18 @@ class View(QGraphicsView):
         self.on_nudge = None
         self.on_context = None
         self.on_key = None
+        self.on_resize = None
         self.panning, self.pan_last = False, None
         self.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
         self.setDragMode(QGraphicsView.RubberBandDrag)
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
         self.setViewportUpdateMode(QGraphicsView.FullViewportUpdate)
         self.setMouseTracking(True)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        if self.on_resize:
+            self.on_resize()
 
     def mousePressEvent(self, e):
         if e.button() == Qt.MiddleButton:            # middle button + drag = move the workspace
@@ -1698,30 +1727,67 @@ def apply_look(x, P, size):
     if P["bw"]:
         g = x @ np.array(P["bw"], np.float32)
         x = np.repeat(g[..., None], 3, 2)
-    x = np.clip(x, 0, 1)
-    x = (x - .5) * P["con"] + .5
+    x = np.clip(x, 0, 1)                      # from here on x is our own array, so it can be changed in place
+    x -= .5
+    x *= P["con"]
+    x += .5
     if P["gam"] != 1.0:
-        x = np.clip(x, 0, 1) ** (1.0 / P["gam"])
+        x = np.clip(x, 0, 1)
+        x = x ** (1.0 / P["gam"])
     if not P["bw"]:
         L = lumv(x)
-        x = L + (x - L) * P["sat"]
-        x = x + np.array([P["temp"], P["tint"], -P["temp"]], np.float32)
+        x -= L
+        x *= P["sat"]
+        x += L
+        x += np.array([P["temp"], P["tint"], -P["temp"]], np.float32)
     L = np.clip(lumv(x), 0, 1)
-    tone = np.array(P["tone"], np.float32) if P["bw"] else 0
-    x = x + np.array(P["sh"], np.float32) * (1 - L) ** 2 + np.array(P["hl"], np.float32) * L ** 2 + tone
-    x = P["lift"] + np.clip(x, 0, 1) * (P["hi"] - P["lift"])
+    iL = 1 - L
+    tmp = np.multiply(iL * iL, np.array(P["sh"], np.float32))
+    x += tmp
+    np.multiply(L * L, np.array(P["hl"], np.float32), out=tmp)
+    x += tmp
+    if P["bw"]:
+        x += np.array(P["tone"], np.float32)
+    x = np.clip(x, 0, 1)
+    x *= (P["hi"] - P["lift"])
+    x += P["lift"]
     if P["vig"] > 0:
-        yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
-        r2 = ((xx - w / 2) / (w / 2)) ** 2 + ((yy - h / 2) / (h / 2)) ** 2
-        x = x * (1 - P["vig"] * np.clip(r2 / 2, 0, 1))[..., None]
+        x *= vignette_mask(h, w, P["vig"])
     if P["grain"] > 0:
         k = 2 if size > 1.2 else 1
+        n = grain_cells(h, w, k)
+        Lm = np.clip(lumv(x), 0, 1)
+        x += n * (P["grain"] * .22 * (1 - np.abs(Lm - .5) * 1.2))
+    return x
+
+
+_VIG, _CELLS = {}, {}
+
+
+def vignette_mask(h, w, vig):
+    """Darkening towards the corners (cached: it is the same for every frame of a video)."""
+    key = (h, w, vig)
+    m = _VIG.get(key)
+    if m is None:
+        _VIG.clear()
+        yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+        r2 = ((xx - w / 2) / (w / 2)) ** 2 + ((yy - h / 2) / (h / 2)) ** 2
+        m = (1 - vig * np.clip(r2 / 2, 0, 1))[..., None].astype(np.float32)
+        _VIG[key] = m
+    return m
+
+
+def grain_cells(h, w, k):
+    """Film grain pattern (cached, same every frame as before)."""
+    key = (h, w, k)
+    n = _CELLS.get(key)
+    if n is None:
+        _CELLS.clear()
         n = np.random.default_rng(3).standard_normal((-(-h // k), -(-w // k), 1)).astype(np.float32)
         if k > 1:
             n = block_up(n, k, h, w)
-        Lm = np.clip(lumv(x), 0, 1)
-        x = x + n * P["grain"] * .22 * (1 - np.abs(Lm - .5) * 1.2)
-    return x
+        _CELLS[key] = n
+    return n
 
 
 FILTER_GROUPS = [
@@ -1770,6 +1836,12 @@ def box_blur(x, r):
             n = x.shape[ax]
             x = (np.take(c, np.arange(k, n + k), axis=ax) - np.take(c, np.arange(0, n), axis=ax)) / k
     return x
+
+
+def chroma(x):
+    """max(R,G,B) - min(R,G,B) per pixel as (h, w, 1): about 30x faster than x.max(-1) - x.min(-1) on big frames."""
+    r, g, b = x[..., 0], x[..., 1], x[..., 2]
+    return (np.maximum(np.maximum(r, g), b) - np.minimum(np.minimum(r, g), b))[..., None]
 
 
 def lumv(x):
@@ -1887,7 +1959,7 @@ def apply_filter(x, f, a):
     if f == "Saturation Boost":
         return L + (x - L) * 1.65
     if f == "Vibrance Boost":
-        sat = x.max(-1, keepdims=True) - x.min(-1, keepdims=True)
+        sat = chroma(x)
         return L + (x - L) * (1 + 1.1 * (1 - sat))
     if f == "Cross Process":
         r = smooth01(x[..., 0] * 1.05 - 0.02) * 0.6 + x[..., 0] * 0.4 + 0.03
@@ -2040,8 +2112,10 @@ def adjust_rgb(x, a):
         x = np.clip(x, 0, 1)
     if g("saturation") or g("vibrance"):
         gray = lum(x)[..., None]
-        sat = (x.max(-1, keepdims=True) - x.min(-1, keepdims=True))
-        x = gray + (x - gray) * (1 + g("saturation") + g("vibrance") * (1 - sat))
+        if g("vibrance"):
+            x = gray + (x - gray) * (1 + g("saturation") + g("vibrance") * (1 - chroma(x)))
+        else:
+            x = gray + (x - gray) * (1 + g("saturation"))
     f = a.get("filter", "None")
     if f != "None":
         pre = x
@@ -3769,6 +3843,51 @@ def template_snapshot(t):
             "bg_mode": "gradient" if t.get("bg2") else "solid", "bg_angle": 35, "bg_tex": None, "items": items}
 
 
+class TemplateDelegate(QStyledItemDelegate):
+    """Template picker card: the template picture, its name and how many slides / what size."""
+    def sizeHint(self, option, index):
+        return QSize(440, 212)
+
+    def paint(self, p, option, index):
+        pal = QApplication.palette()
+        acc, txt, mut = pal.color(QPalette.Highlight), pal.color(QPalette.WindowText), pal.color(QPalette.PlaceholderText)
+        r = QRectF(option.rect).adjusted(5, 5, -5, -5)
+        sel, hov = bool(option.state & QStyle.State_Selected), bool(option.state & QStyle.State_MouseOver)
+        p.save()
+        p.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
+        bg = QColor(acc)
+        bg.setAlpha(36)
+        p.setPen(QPen(acc if sel else QColor(128, 134, 150, 130 if hov else 60), 2 if sel else 1))
+        p.setBrush(bg if sel else pal.color(QPalette.Base))
+        p.drawRoundedRect(r, 14, 14)
+        ic = index.data(Qt.DecorationRole)
+        name, _, meta = (index.data(Qt.DisplayRole) or "").partition("\n")
+        area = QRectF(r.left() + 10, r.top() + 10, r.width() - 20, 140)
+        if isinstance(ic, QIcon):
+            pm = ic.pixmap(QSize(860, 340))
+            sc = pm.scaled(int(area.width() * 2), int(area.height() * 2), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            w, h = sc.width() / 2, sc.height() / 2
+            tgt = QRectF(area.center().x() - w / 2, area.center().y() - h / 2, w, h)
+            clip = QPainterPath()
+            clip.addRoundedRect(tgt, 8, 8)
+            p.save()
+            p.setClipPath(clip)
+            p.drawPixmap(tgt, sc, QRectF(sc.rect()))
+            p.restore()
+        f = QFont(option.font)
+        f.setPixelSize(13)
+        f.setWeight(QFont.Bold)
+        p.setFont(f)
+        p.setPen(txt)
+        p.drawText(QRectF(r.left() + 14, r.top() + 158, r.width() - 28, 20), Qt.AlignLeft | Qt.AlignVCenter, name)
+        f.setPixelSize(11)
+        f.setWeight(QFont.Normal)
+        p.setFont(f)
+        p.setPen(mut)
+        p.drawText(QRectF(r.left() + 14, r.top() + 177, r.width() - 28, 16), Qt.AlignLeft | Qt.AlignVCenter, meta)
+        p.restore()
+
+
 class TemplatesDialog(QDialog):
     """Ready-made carousel layouts (grids, text, product...). Pick one, then fill the grids with your photos."""
     def __init__(self, main, parent=None):
@@ -3779,7 +3898,11 @@ class TemplatesDialog(QDialog):
         self.resize(960, 700)
         lay = QVBoxLayout(self)
         top = QHBoxLayout()
-        top.addWidget(QLabel("Category:"))
+        tl_ = QLabel("Templates")
+        tl_.setObjectName("h2")
+        top.addWidget(tl_)
+        top.addSpacing(14)
+        top.addWidget(QLabel("Category"))
         self.cat = QComboBox()
         self.cat.addItems(["All"] + list(dict.fromkeys(t["cat"] for t in TEMPLATES)))
         self.cat.currentTextChanged.connect(self.fill)
@@ -3789,13 +3912,15 @@ class TemplatesDialog(QDialog):
         self.lst = QListWidget()
         self.lst.setViewMode(QListWidget.IconMode)
         self.lst.setIconSize(QSize(430, 170))
-        self.lst.setSpacing(10)
+        self.lst.setSpacing(4)
+        self.lst.setItemDelegate(TemplateDelegate(self.lst))
+        self.lst.setMouseTracking(True)
         self.lst.setMovement(QListWidget.Static)
         self.lst.setResizeMode(QListWidget.Adjust)
         self.lst.setWordWrap(True)
         self.lst.itemDoubleClicked.connect(lambda *_: self.use())
         lay.addWidget(self.lst, 1)
-        lay.addWidget(QLabel("Grids are empty photo frames: select one, then Layer > Fill Grid Cells with Images..."))
+        lay.addWidget(QLabel("Photo frames start empty: select the grid, then press Fill cells in the tool bar to add your photos."))
         bb = QDialogButtonBox(QDialogButtonBox.Cancel)
         b = bb.addButton("Use Template", QDialogButtonBox.AcceptRole)
         b.setObjectName("primary")
@@ -3816,7 +3941,7 @@ class TemplatesDialog(QDialog):
                 self.icons[t["name"]] = QIcon(self.main.template_pixmap(t))
             li = QListWidgetItem(self.icons[t["name"]], f"{t['name']}\n{t['n']} slides  -  {t['pw']} x {t['ph']}")
             li.setData(Qt.UserRole, t["name"])
-            li.setSizeHint(QSize(450, 215))
+            li.setSizeHint(QSize(440, 212))
             self.lst.addItem(li)
         if self.lst.count():
             self.lst.setCurrentRow(0)
@@ -4092,16 +4217,25 @@ def fps_str(fps):
 
 
 def video_frame_image(cv2, fr, crop, adj, tw, th):
-    """Original BGR frame -> crop -> resized to the export size -> Edit Image filters -> QImage. Safe to run on worker threads."""
+    """Original BGR frame -> crop -> resized to the export size -> Edit Image filters -> QImage. Safe to run on worker threads.
+    When the picture has fewer real pixels than the export size (for example a 1080p clip saved at 2x), the filters work on
+    the real pixels and the result is enlarged afterwards: the filters cost 2 to 4 times less and the image is the same."""
     H, W = fr.shape[:2]
     if crop:
         x0, y0 = int(crop[0] * W), int(crop[1] * H)
         fr = fr[y0:max(y0 + 1, int(crop[3] * H)), x0:max(x0 + 1, int(crop[2] * W))]
-    interp = cv2.INTER_AREA if fr.shape[1] > tw else cv2.INTER_LANCZOS4
-    fr = cv2.resize(fr, (tw, th), interpolation=interp)
+    ww, wh = tw, th
+    if adj:
+        k = min(1.0, fr.shape[1] / tw, fr.shape[0] / th)
+        if k < 0.8:
+            ww, wh = max(16, int(tw * k)), max(16, int(th * k))
+    interp = cv2.INTER_AREA if fr.shape[1] > ww else cv2.INTER_LANCZOS4
+    fr = cv2.resize(fr, (ww, wh), interpolation=interp)
     rgb = np.ascontiguousarray(cv2.cvtColor(fr, cv2.COLOR_BGR2RGB))
     if adj:
         rgb = (np.clip(adjust_rgb(rgb.astype(np.float32) / 255.0, adj), 0, 1) * 255 + 0.5).astype(np.uint8)
+        if (ww, wh) != (tw, th):
+            rgb = cv2.resize(rgb, (tw, th), interpolation=cv2.INTER_LANCZOS4)
         rgb = np.ascontiguousarray(rgb)
     return QImage(rgb.data, tw, th, tw * 3, QImage.Format_RGB888).copy()
 
@@ -4155,67 +4289,152 @@ def est_video_mb(W, H):
 
 
 def video_workers(limits, sizes, has_filters):
-    """How many frames may be filtered at the same time: about half of the allowed threads, but never more than the
-    memory budget allows (one frame in the filter needs ~100 bytes per pixel)."""
+    """How many frames may be filtered at the same time: most of the allowed threads (one is kept for drawing, one for the
+    encoder), but never more than the memory budget allows (one frame in the filter needs ~100 bytes per pixel)."""
     if not has_filters:
         return 1
-    n = max(1, (limits.threads or 2) // 2) if limits.mode != "fast" else max(1, limits.threads - 1)
+    th = limits.threads or 2
+    n = max(1, th - 2)
     per = max(w * h for w, h in sizes) * 100 / 1048576.0
-    budget = 1200.0
+    budget = 1800.0
     av = available_ram_mb()
     if av:
-        budget = min(budget, av * 0.2)
-    return int(max(1, min(n, 6, budget // max(per, 1))))
+        budget = min(budget, av * 0.25)
+    return int(max(1, min(n, 8, budget // max(per, 1))))
+
+
+_JOB = {"h": None}
+
+
+def _win_cpu_cap(percent):
+    """Windows: put this process (and the encoders it starts) in a job whose CPU use is capped at `percent` of the whole PC.
+    A hard cap works even when the per-core restriction is ignored. Returns True when it took effect."""
+    import ctypes
+    from ctypes import wintypes
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
+    k.GetCurrentProcess.restype = wintypes.HANDLE
+    k.CreateJobObjectW.restype = wintypes.HANDLE
+    k.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+    k.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+    k.SetInformationJobObject.restype = wintypes.BOOL
+    k.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    k.AssignProcessToJobObject.restype = wintypes.BOOL
+
+    class RATE(ctypes.Structure):
+        _fields_ = [("ControlFlags", wintypes.DWORD), ("CpuRate", wintypes.DWORD)]
+    first = _JOB["h"] is None
+    if first:
+        _JOB["h"] = k.CreateJobObjectW(None, None)
+        if not _JOB["h"]:
+            return False
+    info = RATE(0x1 | 0x4, int(max(5, min(100, percent)) * 100))          # ENABLE | HARD_CAP, rate in 1/100 percent
+    if not k.SetInformationJobObject(_JOB["h"], 15, ctypes.byref(info), ctypes.sizeof(info)):
+        return False
+    if first and not k.AssignProcessToJobObject(_JOB["h"], k.GetCurrentProcess()):
+        return False
+    return True
 
 
 class ExportLimits:
-    """While exporting, keep the PC usable: lower priority and use only part of the CPU cores.
+    """While exporting, keep the PC cool and usable: lower priority, fewer cores and a hard ceiling on CPU use.
     mode: 'balanced' (about half, recommended), 'gentle' (2 cores), 'fast' (everything)."""
     def __init__(self, mode="balanced"):
-        self.mode, self.threads, self.low_priority = mode, os.cpu_count() or 2, mode != "fast"
+        ncpu = os.cpu_count() or 2
+        self.mode, self.low_priority = mode, mode != "fast"
+        self.ncpu = ncpu
+        self.threads = self.want(ncpu)
         self.saved = None
+        self.status = ""
+        self.cv_threads = None
+
+    def want(self, n):
+        return n if self.mode == "fast" else (min(2, n) if self.mode == "gentle" else max(1, n // 2))
 
     def pick(self, cpus):
         n = len(cpus)
-        want = n if self.mode == "fast" else (min(2, n) if self.mode == "gentle" else max(1, n // 2))
+        want = self.want(n)
         if want >= n:
             return list(cpus)
         step = max(1, n // want)          # every other logical CPU = one thread per physical core on SMT chips
         return list(cpus)[::step][:want]
 
     def __enter__(self):
+        notes = []
+        try:
+            if cv2 is not None:
+                self.cv_threads = cv2.getNumThreads()
+                cv2.setNumThreads(max(1, self.threads))
+        except Exception:
+            pass
         try:
             if sys.platform == "win32":
                 import ctypes
-                k = ctypes.windll.kernel32
+                from ctypes import wintypes
+                k = ctypes.WinDLL("kernel32", use_last_error=True)
+                k.GetCurrentProcess.restype = wintypes.HANDLE
+                k.GetPriorityClass.argtypes = [wintypes.HANDLE]
+                k.GetPriorityClass.restype = wintypes.DWORD
+                k.SetPriorityClass.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+                k.SetPriorityClass.restype = wintypes.BOOL
+                k.GetProcessAffinityMask.argtypes = [wintypes.HANDLE, ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t)]
+                k.GetProcessAffinityMask.restype = wintypes.BOOL
+                k.SetProcessAffinityMask.argtypes = [wintypes.HANDLE, ctypes.c_size_t]
+                k.SetProcessAffinityMask.restype = wintypes.BOOL
                 h = k.GetCurrentProcess()
                 pm, sm = ctypes.c_size_t(), ctypes.c_size_t()
-                k.GetProcessAffinityMask(h, ctypes.byref(pm), ctypes.byref(sm))
-                cpus = [b for b in range(64) if pm.value >> b & 1]
-                keep = self.pick(cpus)
-                self.saved = (k.GetPriorityClass(h), pm.value)
-                if self.low_priority:
-                    k.SetPriorityClass(h, 0x4000)                      # BELOW_NORMAL
-                if len(keep) < len(cpus):
-                    k.SetProcessAffinityMask(h, sum(1 << b for b in keep))
-                self.threads = len(keep)
+                if k.GetProcessAffinityMask(h, ctypes.byref(pm), ctypes.byref(sm)):
+                    cpus = [b for b in range(64) if pm.value >> b & 1]
+                    keep = self.pick(cpus)
+                    self.saved = (k.GetPriorityClass(h), pm.value)
+                    if self.low_priority:
+                        notes.append("lower priority" if k.SetPriorityClass(h, 0x4000) else "")
+                    if len(keep) < len(cpus):
+                        if k.SetProcessAffinityMask(h, sum(1 << b for b in keep)):
+                            notes.append(f"{len(keep)} of {len(cpus)} threads")
+                    self.threads = len(keep)
+                if self.mode != "fast":
+                    pct = 100.0 * self.threads / max(1, self.ncpu)
+                    try:
+                        if _win_cpu_cap(pct):
+                            notes.append(f"CPU capped at {int(round(pct))}%")
+                            self.capped = True
+                    except Exception:
+                        pass
             elif hasattr(os, "sched_getaffinity"):
                 cpus = sorted(os.sched_getaffinity(0))
                 keep = self.pick(cpus)
                 self.saved = (None, set(cpus))
                 os.sched_setaffinity(0, set(keep))
                 self.threads = len(keep)
+                notes.append(f"{len(keep)} of {len(cpus)} threads")
         except Exception:
             pass
+        self.status = ", ".join(n for n in notes if n)
         return self
 
+    capped = False
+
     def __exit__(self, *a):
+        try:
+            if self.cv_threads is not None and cv2 is not None:
+                cv2.setNumThreads(self.cv_threads)
+        except Exception:
+            pass
+        try:
+            if self.capped and sys.platform == "win32":
+                _win_cpu_cap(100)                              # lift the ceiling again
+        except Exception:
+            pass
         try:
             if self.saved is None:
                 return
             if sys.platform == "win32":
                 import ctypes
-                k = ctypes.windll.kernel32
+                from ctypes import wintypes
+                k = ctypes.WinDLL("kernel32", use_last_error=True)
+                k.GetCurrentProcess.restype = wintypes.HANDLE
+                k.SetPriorityClass.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+                k.SetProcessAffinityMask.argtypes = [wintypes.HANDLE, ctypes.c_size_t]
                 h = k.GetCurrentProcess()
                 k.SetPriorityClass(h, self.saved[0] or 0x20)
                 k.SetProcessAffinityMask(h, self.saved[1])
@@ -4339,7 +4558,7 @@ def slide_rect(sc, k):
 def video_slide_map(sc):
     """{slide index: [video layers that appear on it]}."""
     out = {}
-    vids = [i for i in sc.items() if HAS_VIDEO and isinstance(i, VideoItem) and i.parentItem() is None]
+    vids = [i for i in sc.items() if HAS_VIDEO and isinstance(i, VideoItem) and i.parentItem() is None and not i.data(8)]
     for k in range(sc.n * sc.rows):
         r = slide_rect(sc, k)
         on = [v for v in vids if v.sceneBoundingRect().intersected(r).width() > 0.5 and v.sceneBoundingRect().intersected(r).height() > 0.5]
@@ -4378,7 +4597,9 @@ class TrimDialog(QDialog):
             lay.addWidget(b)
             self.sl = None
             return
-        lay.addWidget(QLabel("Keep only this part of the video. The rest is not used in the editor or in the exported slides."))
+        intro = QLabel("Keep only this part of the video. The rest is not used in the editor or in the exported slides.")
+        intro.setWordWrap(True)
+        lay.addWidget(intro)
         st, en = (v.trim or (0, dur))
         self.sl, self.sp = {}, {}
         for key, label, val in (("start", "Start (seconds)", st), ("end", "End (seconds)", en)):
@@ -4392,7 +4613,9 @@ class TrimDialog(QDialog):
             sp.setRange(0, dur / 1000.0)
             sp.setValue(val / 1000.0)
             sp.setSingleStep(0.1)
-            sp.setFixedWidth(90)
+            sp.setFixedWidth(110)
+            sp.setMinimumHeight(32)
+            sp.setToolTip("Type a time, or use the arrows to change it by 0.1 s")
             sl.valueChanged.connect(lambda x, k=key: self.changed(k, x, True))
             sp.valueChanged.connect(lambda x, k=key: self.changed(k, int(round(x * 1000)), False))
             row.addWidget(sl, 1)
@@ -4579,27 +4802,32 @@ class ExportDialog(QDialog):
 
 
 # ---------------------------------------------------------------- settings / theme / system info
-APP_BUILD = "Beta 0.0.1"
-VERSION_LINES = ["Aero Beta version 0.0.1 - Beta in testing, not for general deployment. Expect bugs and issues. Currently in development.",
+APP_VERSION = "1.0.0"
+APP_BUILD = APP_VERSION
+VERSION_LINES = [f"Aero version {APP_VERSION}",
                  "Created by Winserendipity",
                  "All Rights Reserved. 2026"]
 VERSION_TEXT = VERSION_LINES[0]
 LANGUAGES = ["English", "Filipino", "Espa\u00f1ol", "Fran\u00e7ais", "Deutsch", "Portugu\u00eas", "Italiano",
              "\u65e5\u672c\u8a9e", "\ud55c\uad6d\uc5b4", "\u4e2d\u6587 (\u7b80\u4f53)"]
-DEFAULT_ACCENT = "#c6f135"
+DEFAULT_ACCENT = "#6c7bff"
 
 
 def cfg():
     return QSettings("AeroPhotoEditor", "Editor")
 
 
+ACCENT_PRESETS = [("Indigo", "#6c7bff"), ("Violet", "#a070ff"), ("Sky", "#3aa0ff"), ("Mint", "#2ed3a3"),
+                  ("Coral", "#ff6b78"), ("Amber", "#ffb020"), ("Lime", "#c6f135")]
 THEMES = {
-    "Dark": dict(bg="#08080a", panel="#101013", field="#17171b", border="#1e1e23", border2="#2b2b32", text="#ededf1",
-                 muted="#8a8a96", hover="#1a1a1f", press="#24242b", canvas="#0c0c0f"),
-    "Light": dict(bg="#eef0f4", panel="#ffffff", field="#f3f4f8", border="#e3e5ec", border2="#d2d5df", text="#16161a",
-                  muted="#6c6e7b", hover="#eceef4", press="#dfe2ea", canvas="#e4e6ec"),
+    "Dark": dict(bg="#12141b", panel="#181b24", field="#1f232e", border="#262b38", border2="#363c4d", text="#eef0f6",
+                 muted="#8c94a8", hover="#1f2430", press="#2a3040", canvas="#0d0f14", raised="#1f232e"),
+    "Light": dict(bg="#eceef2", panel="#f7f7f9", field="#ffffff", border="#e1e3e9", border2="#cfd3dc", text="#171a21",
+                  muted="#667085", hover="#eceef3", press="#e1e4ea", canvas="#fbfbfc", raised="#ffffff"),
 }
-PASTEBOARD = QColor("#0c0c0f")          # area around the slides (follows the theme)
+PASTEBOARD = QColor("#0d0f14")          # area around the slides (follows the theme)
+UI_DOT = QColor(255, 255, 255, 34)      # dot grid on the workspace
+UI_LABEL = QColor("#8b93a3")            # slide names above the slides
 
 
 def theme_tokens(theme=None, accent=None):
@@ -4612,9 +4840,13 @@ def theme_tokens(theme=None, accent=None):
         ac = QColor(DEFAULT_ACCENT)
     t["dark"] = theme != "Light"
     t["accent"] = ac.name()
-    t["accent_text"] = "#0d1103" if ac.lightnessF() > .55 else "#ffffff"
+    lin = lambda v: (v / 255.0) ** 2.2
+    lum = 0.2126 * lin(ac.red()) + 0.7152 * lin(ac.green()) + 0.0722 * lin(ac.blue())
+    t["accent_text"] = "#0d1103" if lum > 0.34 else "#ffffff"
     t["accent_soft"] = f"rgba({ac.red()}, {ac.green()}, {ac.blue()}, 0.18)"
     t["accent_hover"] = ac.lighter(112).name()
+    h, sat, val, _ = ac.getHsv()
+    t["accent2"] = QColor.fromHsv((max(h, 0) + 32) % 360, min(255, sat + 10), min(255, val), 255).name() if h >= 0 else ac.name()
     return t
 
 
@@ -4641,21 +4873,243 @@ def _tick(path, color):
     pm.save(str(path), "PNG")
 
 
+def draw_ui_icon(p, name, color, S):
+    """One line icon on a 24 x 24 grid (drawn in code, so no image files and it follows the theme colour)."""
+    u = S / 24.0
+    col = QColor(color)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setPen(QPen(col, 1.9 * u, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+    p.setBrush(Qt.NoBrush)
+    P = lambda x, y: QPointF(x * u, y * u)
+    R = lambda x, y, w, h: QRectF(x * u, y * u, w * u, h * u)
+    L = lambda x1, y1, x2, y2: p.drawLine(P(x1, y1), P(x2, y2))
+    PL = lambda *pts: p.drawPolyline([P(x, y) for x, y in pts])
+    soft = QColor(col)
+    soft.setAlpha(70)
+    if name == "image":
+        p.drawRoundedRect(R(3.5, 4.5, 17, 15), 3 * u, 3 * u)
+        p.drawEllipse(P(9, 10), 1.6 * u, 1.6 * u)
+        PL((4, 17), (10, 12.5), (14, 15.5), (17, 13), (20, 16))
+    elif name == "video":
+        p.drawRoundedRect(R(3, 6, 13.5, 12), 3 * u, 3 * u)
+        PL((16.5, 10.5), (21, 7.5), (21, 16.5), (16.5, 13.5))
+    elif name in ("volume", "mute"):
+        PL((4, 9.5), (8, 9.5), (12.5, 5.5), (12.5, 18.5), (8, 14.5), (4, 14.5), (4, 9.5))
+        if name == "volume":
+            PL((15.5, 9), (17, 12), (15.5, 15))
+            PL((18, 6.5), (20.5, 12), (18, 17.5))
+        else:
+            L(16, 9.5, 21, 14.5)
+            L(21, 9.5, 16, 14.5)
+    elif name == "text":
+        L(5, 6, 19, 6)
+        L(12, 6, 12, 19)
+        L(9, 19, 15, 19)
+    elif name == "shape":
+        p.drawRoundedRect(R(3.5, 10.5, 10, 10), 2 * u, 2 * u)
+        p.drawEllipse(P(15, 9), 5.2 * u, 5.2 * u)
+    elif name == "grid":
+        for x, y, w, h in ((4, 4, 7, 9), (13, 4, 7, 5), (13, 11, 7, 9), (4, 15, 7, 5)):
+            p.drawRoundedRect(R(x, y, w, h), 1.8 * u, 1.8 * u)
+    elif name == "template":
+        p.drawRoundedRect(R(3.5, 4, 17, 16), 3 * u, 3 * u)
+        L(3.5, 9.5, 20.5, 9.5)
+        L(10, 9.5, 10, 20)
+    elif name == "crop":
+        PL((7, 3), (7, 17), (21, 17))
+        PL((3, 7), (17, 7), (17, 21))
+    elif name == "replace":
+        PL((4, 9), (19, 9))
+        PL((15.5, 5.5), (19, 9), (15.5, 12.5))
+        PL((20, 15), (5, 15))
+        PL((8.5, 11.5), (5, 15), (8.5, 18.5))
+    elif name == "adjust":
+        for y, kx in ((7, 9), (12, 15.5), (17, 8)):
+            L(4, y, 20, y)
+            p.setBrush(QColor("#000000") if False else soft)
+            p.drawEllipse(P(kx, y), 2.4 * u, 2.4 * u)
+            p.setBrush(Qt.NoBrush)
+    elif name == "canvas":
+        PL((12, 4), (21, 9), (12, 14), (3, 9), (12, 4))
+        PL((3, 13), (12, 18), (21, 13))
+    elif name in ("undo", "redo"):
+        x = (lambda v: v) if name == "undo" else (lambda v: 24 - v)
+        PL((x(9), 5), (x(4), 10), (x(9), 15))
+        path = QPainterPath(P(x(4), 10))
+        path.lineTo(P(x(14), 10))
+        path.quadTo(P(x(20), 10), P(x(20), 14.5))
+        path.quadTo(P(x(20), 19), P(x(14), 19))
+        path.lineTo(P(x(9), 19))
+        p.drawPath(path)
+    elif name == "play":
+        p.drawPolygon(QPolygonF([P(8, 5.5), P(19, 12), P(8, 18.5)]))
+    elif name == "export":
+        PL((4, 15), (4, 20), (20, 20), (20, 15))
+        L(12, 4, 12, 15)
+        PL((7.5, 10.5), (12, 15), (16.5, 10.5))
+    elif name in ("front", "back"):
+        a, b = R(3.5, 3.5, 12, 12), R(8.5, 8.5, 12, 12)
+        if name == "front":
+            p.drawRoundedRect(a, 2.5 * u, 2.5 * u)
+            p.setBrush(soft)
+            p.drawRoundedRect(b, 2.5 * u, 2.5 * u)
+        else:
+            p.setBrush(soft)
+            p.drawRoundedRect(a, 2.5 * u, 2.5 * u)
+            p.setBrush(Qt.NoBrush)
+            p.drawRoundedRect(b, 2.5 * u, 2.5 * u)
+    elif name == "trash":
+        L(4, 7, 20, 7)
+        PL((9, 7), (9, 4), (15, 4), (15, 7))
+        PL((6, 7), (7, 20), (17, 20), (18, 7))
+        L(10, 11, 10, 16)
+        L(14, 11, 14, 16)
+    elif name == "duplicate":
+        p.drawRoundedRect(R(8.5, 8.5, 12, 12), 2.5 * u, 2.5 * u)
+        path = QPainterPath(P(15.5, 5.5))
+        path.lineTo(P(6, 5.5))
+        path.quadTo(P(3.5, 5.5), P(3.5, 8))
+        path.lineTo(P(3.5, 17.5))
+        p.drawPath(path)
+    elif name == "guides":
+        L(9, 3, 9, 21)
+        L(15, 3, 15, 21)
+        L(3, 9, 21, 9)
+        L(3, 15, 21, 15)
+    elif name == "snap":
+        path = QPainterPath(P(6, 4))
+        path.lineTo(P(6, 11))
+        path.arcTo(R(6, 5, 12, 12), 180, 180)
+        path.lineTo(P(18, 4))
+        p.drawPath(path)
+        L(6, 8, 10, 8)
+        L(14, 8, 18, 8)
+    elif name == "fit":
+        PL((4, 9), (4, 4), (9, 4))
+        PL((15, 4), (20, 4), (20, 9))
+        PL((20, 15), (20, 20), (15, 20))
+        PL((9, 20), (4, 20), (4, 15))
+    elif name == "plus":
+        L(12, 5, 12, 19)
+        L(5, 12, 19, 12)
+    elif name == "minus":
+        L(5, 12, 19, 12)
+    elif name == "folder":
+        path = QPainterPath(P(3, 8))
+        path.lineTo(P(3, 18)); path.quadTo(P(3, 20), P(5, 20)); path.lineTo(P(19, 20)); path.quadTo(P(21, 20), P(21, 18))
+        path.lineTo(P(21, 9)); path.quadTo(P(21, 7), P(19, 7)); path.lineTo(P(11, 7)); path.lineTo(P(9, 4.5))
+        path.lineTo(P(5, 4.5)); path.quadTo(P(3, 4.5), P(3, 6.5)); path.closeSubpath()
+        p.drawPath(path)
+    elif name == "settings":
+        for y, kx in ((7, 15), (12, 8), (17, 16)):
+            L(4, y, 20, y)
+            p.setBrush(soft)
+            p.drawEllipse(P(kx, y), 2.4 * u, 2.4 * u)
+            p.setBrush(Qt.NoBrush)
+    elif name == "tips":
+        p.drawEllipse(P(12, 10), 6 * u, 6 * u)
+        L(9.5, 19, 14.5, 19)
+        L(10.5, 21.5, 13.5, 21.5)
+        L(12, 7, 12, 10.5)
+    elif name == "info":
+        p.drawEllipse(P(12, 12), 8.5 * u, 8.5 * u)
+        L(12, 11, 12, 16.5)
+        L(12, 7.6, 12, 7.7)
+    elif name == "layers":
+        PL((12, 4), (21, 9), (12, 14), (3, 9), (12, 4))
+        PL((3, 13), (12, 18), (21, 13))
+    elif name == "home":
+        PL((4, 11), (12, 4), (20, 11))
+        PL((6, 10), (6, 20), (18, 20), (18, 10))
+    elif name == "bold":
+        L(8, 5, 8, 19)
+        a = QPainterPath(P(8, 5)); a.lineTo(P(13, 5)); a.quadTo(P(17, 5), P(17, 8.5)); a.quadTo(P(17, 12), P(13, 12)); a.lineTo(P(8, 12))
+        b = QPainterPath(P(8, 12)); b.lineTo(P(14, 12)); b.quadTo(P(18, 12), P(18, 15.5)); b.quadTo(P(18, 19), P(14, 19)); b.lineTo(P(8, 19))
+        p.drawPath(a); p.drawPath(b)
+    elif name == "italic":
+        L(14, 5, 10, 19); L(11, 5, 17, 5); L(7, 19, 13, 19)
+    elif name == "underline":
+        u_ = QPainterPath(P(7, 4)); u_.lineTo(P(7, 11)); u_.arcTo(R(7, 6, 10, 10), 180, 180); u_.lineTo(P(17, 4))
+        p.drawPath(u_); L(5, 20, 19, 20)
+    elif name in ("alignl", "alignc", "alignr", "alignj"):
+        spans = {"alignl": ((4, 20), (4, 14), (4, 20), (4, 14)), "alignc": ((4, 20), (7, 17), (4, 20), (7, 17)),
+                 "alignr": ((4, 20), (10, 20), (4, 20), (10, 20)), "alignj": ((4, 20),) * 4}[name]
+        for y, (x1, x2) in zip((6, 10.3, 14.6, 19), spans):
+            L(x1, y, x2, y)
+    elif name in ("eye", "eyeoff"):
+        e_ = QPainterPath(P(2.5, 12)); e_.quadTo(P(12, 3.5), P(21.5, 12)); e_.quadTo(P(12, 20.5), P(2.5, 12))
+        p.drawPath(e_); p.drawEllipse(P(12, 12), 3 * u, 3 * u)
+        if name == "eyeoff":
+            L(4.5, 20, 19.5, 4)
+    elif name == "lock":
+        p.drawRoundedRect(R(5, 11, 14, 9.5), 2.5 * u, 2.5 * u)
+        k_ = QPainterPath(P(8, 11)); k_.lineTo(P(8, 8)); k_.arcTo(R(8, 4, 8, 8), 180, -180); k_.lineTo(P(16, 11))
+        p.drawPath(k_)
+    elif name == "search":
+        p.drawEllipse(P(11, 11), 6 * u, 6 * u); L(15.5, 15.5, 20, 20)
+    elif name == "chevd":
+        PL((6, 9), (12, 15), (18, 9))
+    elif name == "chevr":
+        PL((9, 6), (15, 12), (9, 18))
+    elif name == "chevl":
+        PL((15, 6), (9, 12), (15, 18))
+    elif name == "fliph":
+        L(12, 3.5, 12, 20.5)
+        p.drawPolygon(QPolygonF([P(4, 18), P(9.5, 7), P(9.5, 18)]))
+        p.drawPolygon(QPolygonF([P(14.5, 18), P(14.5, 7), P(20, 18)]))
+    elif name == "flipv":
+        L(3.5, 12, 20.5, 12)
+        p.drawPolygon(QPolygonF([P(18, 4), P(7, 9.5), P(18, 9.5)]))
+        p.drawPolygon(QPolygonF([P(18, 14.5), P(7, 14.5), P(18, 20)]))
+    elif name == "more":
+        p.setBrush(col)
+        for x in (6, 12, 18):
+            p.drawEllipse(P(x, 12), 1.3 * u, 1.3 * u)
+    elif name == "sun":
+        p.drawEllipse(P(12, 12), 4 * u, 4 * u)
+        for a_ in range(8):
+            c_, s_ = math.cos(a_ * math.pi / 4), math.sin(a_ * math.pi / 4)
+            L(12 + 7 * c_, 12 + 7 * s_, 12 + 9.5 * c_, 12 + 9.5 * s_)
+    elif name == "move":
+        L(12, 3.5, 12, 20.5); L(3.5, 12, 20.5, 12)
+        PL((9, 6.5), (12, 3.5), (15, 6.5)); PL((9, 17.5), (12, 20.5), (15, 17.5))
+        PL((6.5, 9), (3.5, 12), (6.5, 15)); PL((17.5, 9), (20.5, 12), (17.5, 15))
+    else:
+        p.drawRoundedRect(R(4, 4, 16, 16), 3 * u, 3 * u)
+
+
+def ui_icon(name, normal=None, active=None, disabled=None, size=22):
+    """QIcon for a toolbar button: normal colour, accent colour on hover / checked, faded when disabled."""
+    t = theme_tokens()
+    normal, active, disabled = normal or t["text"], active or t["accent"], disabled or t["muted"]
+    S = size * 2
+    ic = QIcon()
+    for color, mode, state in ((normal, QIcon.Normal, QIcon.Off), (active, QIcon.Active, QIcon.Off), (active, QIcon.Normal, QIcon.On),
+                               (active, QIcon.Active, QIcon.On), (disabled, QIcon.Disabled, QIcon.Off), (disabled, QIcon.Disabled, QIcon.On)):
+        pm = QPixmap(S, S)
+        pm.fill(Qt.transparent)
+        pp = QPainter(pm)
+        draw_ui_icon(pp, name, color, S)
+        pp.end()
+        ic.addPixmap(pm, mode, state)
+    return ic
+
+
 QSS = """
 * { font-family: "Inter", "Segoe UI Variable Text", "Segoe UI", "SF Pro Text", "Helvetica Neue", Arial, sans-serif; }
 QMainWindow, QDialog { background: @bg@; }
 QDialog { background: @panel@; }
 QWidget { color: @text@; font-size: 13px; }
 QToolTip { background: @panel@; color: @text@; border: 1px solid @border2@; padding: 5px 8px; }
-QMenuBar { background: @bg@; padding: 6px 10px 2px 10px; spacing: 2px; }
-QMenuBar::item { background: transparent; color: @muted@; padding: 6px 12px; border-radius: 8px; }
+QMenuBar { background: @bg@; padding: 6px 10px 2px 10px; spacing: 2px; border: none; }
+QMenuBar::item { background: transparent; color: @muted@; padding: 5px 11px; border-radius: 7px; font-weight: 500; }
 QMenuBar::item:selected, QMenuBar::item:pressed { background: @hover@; color: @text@; }
 QMenu { background: @panel@; border: 1px solid @border2@; padding: 6px; }
 QMenu::item { padding: 7px 26px 7px 14px; border-radius: 6px; color: @text@; }
 QMenu::item:selected { background: @press@; }
 QMenu::item:disabled { color: @muted@; }
 QMenu::separator { height: 1px; background: @border@; margin: 6px 8px; }
-QToolBar { background: @bg@; border: none; spacing: 4px; padding: 6px 10px 8px 10px; }
+QToolBar { background: @bg@; border: none; spacing: 4px; padding: 4px 10px; }
 QToolBar::separator { background: @border2@; width: 1px; margin: 6px 8px; }
 QToolButton { background: transparent; color: @text@; border: none; border-radius: 9px; padding: 7px 12px; }
 QToolButton:hover { background: @hover@; }
@@ -4703,11 +5157,10 @@ QScrollBar::handle:horizontal:hover { background: @muted@; }
 QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; }
 QScrollBar::add-page, QScrollBar::sub-page { background: none; }
 QDockWidget { color: @muted@; }
-QDockWidget::title { background: @bg@; padding: 11px 14px 7px 14px; text-align: left; }
+QDockWidget::title { background: @bg@; padding: 4px 8px; text-align: left; }
 QMainWindow::separator { background: @bg@; width: 8px; height: 8px; }
 QScrollArea { border: none; background: transparent; }
 QGraphicsView { border: 1px solid @border@; background: @canvas@; }
-QDockWidget > QWidget { border: 1px solid @border@; }
 QListWidget { background: @panel@; border: 1px solid @border@; border-radius: 12px; padding: 6px; outline: 0; }
 QListWidget::item { border-radius: 8px; padding: 6px; color: @text@; }
 QListWidget::item:hover { background: @hover@; }
@@ -4725,12 +5178,127 @@ QGroupBox { border: 1px solid @border@; border-radius: 10px; margin-top: 10px; p
 QGroupBox::title { subcontrol-origin: margin; left: 10px; color: @muted@; }
 QProgressBar { background: @field@; border: none; border-radius: 6px; text-align: center; }
 QProgressBar::chunk { background: @accent@; border-radius: 6px; }
+/* ---- workspace ---- */
+QToolBar#tools { background: @panel@; border: 1px solid @border@; border-radius: 14px; padding: 8px 5px; spacing: 3px; }
+QToolBar#tools QToolButton { color: @muted@; font-size: 11px; font-weight: 600; padding: 8px 2px 6px 2px; min-width: 58px; border-radius: 10px; }
+QToolBar#tools QToolButton:hover { background: @hover@; color: @text@; }
+QToolBar#tools QToolButton:pressed { background: @press@; }
+QToolBar#tools QToolButton::menu-indicator { image: none; width: 0; }
+QToolBar#opts { background: @bg@; padding: 2px 10px 6px 10px; spacing: 6px; }
+QToolBar#opts QToolButton { padding: 6px 8px; border-radius: 8px; }
+QToolBar#opts QLabel { color: @muted@; font-size: 12px; padding: 0 2px 0 6px; }
+QToolBar#opts QSpinBox, QToolBar#opts QComboBox { min-height: 20px; }
+QWidget#panelBody { background: @panel@; border: 1px solid @border@; border-radius: 14px; }
+QWidget#dockHead { background: transparent; border: none; }
+QLabel#dockTitle { color: @text@; font-size: 13px; font-weight: 700; padding: 2px 4px; }
+QLabel#dockCount { color: @muted@; font-size: 12px; }
+QLabel#sect { color: @muted@; font-size: 11px; font-weight: 700; letter-spacing: 1px; padding-top: 6px; }
+QLabel#fieldLab { color: @muted@; font-size: 11px; }
+QLabel#val { color: @text@; font-size: 12px; font-weight: 600; }
+QLabel#hint { color: @muted@; font-size: 12px; }
+QFrame#hline { background: @border@; max-height: 1px; border: none; }
+QToolButton#tipsBtn { color: @muted@; font-size: 12px; font-weight: 600; padding: 4px 2px; }
+QToolButton#tipsBtn:hover { color: @text@; background: transparent; }
+QListWidget#layers { background: transparent; border: none; padding: 2px; }
+QListWidget#layers::item { border-radius: 10px; padding: 5px 6px; margin: 1px 0; color: @text@; }
+QListWidget#layers::item:hover { background: @hover@; }
+QListWidget#layers::item:selected { background: @accent_soft@; color: @text@; }
+QStatusBar { background: @bg@; color: @muted@; padding: 0 8px; }
+QStatusBar QLabel { color: @muted@; font-size: 12px; padding: 0 4px; }
+QToolButton#zoomBtn { padding: 3px 6px; border-radius: 7px; }
+QLabel#statusDot { color: @accent@; }
+QPushButton#ghost { background: transparent; border: 1px solid @border2@; color: @text@; padding: 6px 14px; }
+QPushButton#ghost:hover { background: @hover@; }
+QMainWindow::separator { background: @bg@; width: 8px; height: 8px; }
+QTabBar::tab:!selected { margin-bottom: 8px; }
+/* ---------------- Aero UI 2: app bar, tool options, inspector ---------------- */
+QMenuBar { background: transparent; }
+QWidget#topbar { background: @bg@; }
+QMenuBar#mbar { background: transparent; padding: 0; spacing: 0; }
+QMenuBar#mbar::item { padding: 6px 10px; border-radius: 8px; color: @muted@; font-weight: 600; }
+QMenuBar#mbar::item:selected, QMenuBar#mbar::item:pressed { background: @hover@; color: @text@; }
+QToolButton#homeBtn { background: transparent; border-radius: 12px; padding: 3px; }
+QToolButton#homeBtn:hover { background: @hover@; }
+QLabel#projTitle { color: @text@; font-size: 14px; font-weight: 700; }
+QLabel#projState { color: @muted@; font-size: 11px; }
+QLabel#chipSaved { background: @field@; color: @muted@; border-radius: 9px; padding: 2px 9px; font-size: 11px; font-weight: 600; }
+QLabel#chipDirty { background: @accent_soft@; color: @accent@; border-radius: 9px; padding: 2px 9px; font-size: 11px; font-weight: 700; }
+QFrame#pill { background: @panel@; border: 1px solid @border@; border-radius: 12px; }
+QFrame#pill QToolButton { padding: 4px 7px; border-radius: 8px; color: @text@; font-weight: 600; }
+QFrame#pill QToolButton:hover { background: @hover@; }
+QFrame#vline { background: @border2@; max-width: 1px; min-width: 1px; border: none; }
+QToolBar#opts { background: @panel@; border: 1px solid @border@; border-radius: 14px; padding: 5px 8px; spacing: 6px; }
+QToolBar#opts QToolButton { padding: 5px 8px; border-radius: 9px; }
+QToolButton#fmt { min-width: 30px; max-width: 30px; min-height: 30px; max-height: 30px; padding: 0; border-radius: 9px; }
+QToolButton#fmt:checked { background: @accent_soft@; }
+QToolButton#fmtText { padding: 6px 10px; border-radius: 9px; font-weight: 600; }
+QToolButton#fmtText::menu-indicator { image: none; width: 0; }
+QToolBar#opts QLabel#ctxHint { color: @muted@; padding: 0 6px; }
+QToolBar#opts QFontComboBox, QToolBar#opts QSpinBox { min-height: 24px; }
+QPushButton#secHead { background: transparent; border: none; border-radius: 6px; text-align: left; font-weight: 700; font-size: 12px;
+    color: @text@; padding: 8px 2px 6px 2px; }
+QPushButton#secHead:hover { color: @accent@; background: transparent; }
+QFrame#secLine { background: @border@; max-height: 1px; border: none; }
+QLineEdit#search { border-radius: 10px; padding: 6px 10px 6px 30px; background: @field@; }
+QToolBar#tools { border-radius: 16px; padding: 10px 6px; }
+QToolBar#tools QToolButton { min-width: 56px; border-radius: 12px; }
+QToolBar#tools QToolButton:checked { background: @accent_soft@; color: @accent@; }
+QGraphicsView { border: none; }
+QListWidget#layers { background: transparent; border: none; padding: 0; }
+QMessageBox { background: @panel@; }
+QFrame#card { background: @panel@; border: 1px solid @border@; border-radius: 16px; }
+QFrame#cardSoft { background: @field@; border: 1px solid @border@; border-radius: 14px; }
+QLabel#h1 { color: @text@; font-size: 28px; font-weight: 800; }
+QLabel#h2 { color: @text@; font-size: 16px; font-weight: 700; }
+QLabel#sub { color: @muted@; font-size: 13px; }
+/* ---------------- Aero UI 3: flush, docked studio layout ---------------- */
+QMainWindow { background: @bg@; }
+QWidget#topbar { background: @panel@; border-bottom: 1px solid @border@; }
+QToolBar#opts { background: @panel@; border: none; border-bottom: 1px solid @border@; border-radius: 0; padding: 6px 14px; spacing: 6px; }
+QToolBar#tools { background: @panel@; border: none; border-right: 1px solid @border@; border-radius: 0; padding: 12px 6px; spacing: 2px; }
+QToolBar#tools QToolButton { min-width: 54px; border-radius: 10px; font-size: 10.5px; padding: 8px 0 6px 0; }
+QToolBar#tools::separator { background: @border@; height: 1px; margin: 8px 10px; }
+QWidget#panelBody { background: @panel@; border: none; border-left: 1px solid @border@; border-radius: 0; }
+QMainWindow::separator { background: @border@; width: 1px; height: 1px; }
+QWidget#dockHead { background: @panel@; border: none; border-bottom: 1px solid @border@; border-left: 1px solid @border@; }
+QLabel#dockTitle { color: @text@; font-size: 12px; font-weight: 700; padding: 8px 6px; }
+QStatusBar { background: @panel@; border-top: 1px solid @border@; color: @muted@; padding: 0 10px; }
+QGraphicsView { border: none; background: @canvas@; }
+QPushButton { border-radius: 8px; padding: 6px 14px; }
+QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox { border-radius: 8px; min-height: 22px; }
+QToolButton { border-radius: 8px; }
+QFrame#pill { background: @panel@; border: 1px solid @border2@; border-radius: 12px; }
+QFrame#floatBar { background: @panel@; border: 1px solid @border2@; border-radius: 14px; }
+QFrame#floatBar QToolButton { padding: 5px 8px; border-radius: 9px; color: @text@; font-weight: 600; }
+QFrame#floatBar QToolButton:hover { background: @hover@; }
+QFrame#floatBar QLabel { color: @muted@; font-size: 12px; font-weight: 600; padding: 0 4px; }
+QFrame#floatBar QFrame#vline { background: @border2@; }
+QToolButton#chip { background: transparent; color: @muted@; border: 1px solid transparent; border-radius: 12px; padding: 3px 10px; font-size: 11px; font-weight: 600; }
+QToolButton#chip:hover { background: @hover@; color: @text@; }
+QToolButton#chip:checked { background: @accent_soft@; color: @accent@; border-color: @accent_soft@; }
+QFrame#layerFoot { background: transparent; border-top: 1px solid @border@; }
+QFrame#layerFoot QToolButton { padding: 6px; border-radius: 8px; }
+QPushButton#primary { border: none; background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 @accent@, stop:1 @accent2@); }
+QPushButton#primary:hover { background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 @accent_hover@, stop:1 @accent2@); }
+QPushButton#primary:disabled { background: @field@; color: @muted@; }
+QLabel#secTitle { color: @muted@; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+QFrame#secHeadRow:hover QLabel#secTitle { color: @text@; }
+QSpinBox, QDoubleSpinBox { padding: 2px 30px 2px 8px; }
+QSpinBox::up-button, QDoubleSpinBox::up-button { subcontrol-origin: border; subcontrol-position: top right; width: 24px;
+    border: none; border-left: 1px solid @border2@; border-bottom: 1px solid @border2@; border-top-right-radius: 7px; background: @raised@; }
+QSpinBox::down-button, QDoubleSpinBox::down-button { subcontrol-origin: border; subcontrol-position: bottom right; width: 24px;
+    border: none; border-left: 1px solid @border2@; border-bottom-right-radius: 7px; background: @raised@; }
+QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover, QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover { background: @accent_soft@; }
+QSpinBox::up-button:pressed, QDoubleSpinBox::up-button:pressed, QSpinBox::down-button:pressed, QDoubleSpinBox::down-button:pressed { background: @press@; }
+QSpinBox::up-arrow, QDoubleSpinBox::up-arrow { image: url(@chevup@); width: 16px; height: 16px; }
+QSpinBox::down-arrow, QDoubleSpinBox::down-arrow { image: url(@chev@); width: 16px; height: 16px; }
+QToolBar#opts QSpinBox { padding: 1px 28px 1px 6px; }
 """
 
 
 def apply_theme(app, theme=None, accent=None):
     """Whole-application look: colour palette + one global stylesheet (dark or light, any accent colour)."""
-    global PASTEBOARD
+    global PASTEBOARD, UI_DOT, UI_LABEL
     t = theme_tokens(theme, accent)
     app.setStyle("Fusion")
     pal = QPalette()
@@ -4743,6 +5311,8 @@ def apply_theme(app, theme=None, accent=None):
         pal.setColor(role, QColor(col))
     for role in (QPalette.WindowText, QPalette.Text, QPalette.ButtonText):
         pal.setColor(QPalette.Disabled, role, QColor(t["muted"]))
+    pal.setColor(QPalette.Mid, QColor(t["muted"]))      # text styled with palette(mid) stays readable in both themes
+    pal.setColor(QPalette.PlaceholderText, QColor(t["muted"]))
     app.setPalette(pal)
     try:
         d = Path(QStandardPaths.writableLocation(QStandardPaths.TempLocation)) / "aero_ui"
@@ -4762,7 +5332,11 @@ def apply_theme(app, theme=None, accent=None):
             q = q.replace(f"@{k}@", v)
     app.setStyleSheet(q)
     PASTEBOARD = QColor(t["canvas"])
+    UI_DOT = QColor(255, 255, 255, 30) if t["dark"] else QColor(0, 0, 0, 38)
+    UI_LABEL = QColor(t["muted"])
     for w in app.topLevelWidgets():
+        if hasattr(w, "refresh_icons"):
+            w.refresh_icons()
         sc = getattr(w, "scene", None)
         if sc is not None and hasattr(sc, "update"):
             sc.update()
@@ -4849,30 +5423,151 @@ def system_specs():
     return {"Operating system": os_name, "Processor": f"{cpu}  ({cores} threads)" if cores else cpu, "Memory": ram or "unknown"}
 
 
+class ThemeTile(QPushButton):
+    """Clickable picture of the Dark / Light look (a tiny window drawn in that theme's colours)."""
+    def __init__(self, name):
+        super().__init__()
+        self.name = name
+        self.setCheckable(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedSize(150, 104)
+        self.setToolTip(f"{name} theme")
+
+    def paintEvent(self, ev):
+        t = THEMES[self.name]
+        pal = QApplication.palette()
+        acc = pal.color(QPalette.Highlight)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        r = QRectF(self.rect()).adjusted(1.5, 1.5, -1.5, -1.5)
+        p.setPen(QPen(acc if self.isChecked() else QColor(t["border2"]), 2.5 if self.isChecked() else 1))
+        p.setBrush(QColor(t["bg"]))
+        p.drawRoundedRect(r, 14, 14)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(t["panel"]))
+        p.drawRoundedRect(QRectF(r.left() + 8, r.top() + 22, 28, r.height() - 44), 6, 6)
+        p.drawRoundedRect(QRectF(r.right() - 44, r.top() + 22, 36, r.height() - 44), 6, 6)
+        p.setBrush(QColor(t["canvas"]))
+        p.drawRoundedRect(QRectF(r.left() + 42, r.top() + 22, r.width() - 94, r.height() - 44), 6, 6)
+        p.setBrush(acc)
+        p.drawRoundedRect(QRectF(r.right() - 40, r.top() + 28, 28, 6), 3, 3)
+        p.setBrush(QColor(t["muted"]))
+        p.drawRoundedRect(QRectF(r.left() + 12, r.top() + 8, 30, 5), 2.5, 2.5)
+        p.setBrush(QColor(t["text"]))
+        p.drawRoundedRect(QRectF(r.left() + 46, r.top() + 36, 24, 34), 3, 3)
+        f = QFont(self.font())
+        f.setPixelSize(12)
+        f.setWeight(QFont.DemiBold)
+        p.setFont(f)
+        p.setPen(QColor(t["text"]))
+        p.drawText(QRectF(r.left(), r.bottom() - 20, r.width(), 18), Qt.AlignCenter, self.name)
+
+
+class SizeTile(QPushButton):
+    """Slide format picker: a rectangle with the real proportions, the ratio and the pixel size."""
+    def __init__(self, label, size):
+        super().__init__()
+        self.w, self.h = size
+        self.ratio = label.split(" ")[0]
+        self.kind = label[label.find("(") + 1:label.find(")")] if "(" in label else ""
+        self.setCheckable(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedSize(94, 118)
+        self.setToolTip(f"{label}  -  {self.w} x {self.h} px")
+
+    def paintEvent(self, ev):
+        pal = QApplication.palette()
+        acc, txt, mut = pal.color(QPalette.Highlight), pal.color(QPalette.WindowText), pal.color(QPalette.PlaceholderText)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
+        on, hov = self.isChecked(), self.underMouse()
+        bg = QColor(acc)
+        bg.setAlpha(40 if on else 0)
+        p.setPen(QPen(acc if on else QColor(128, 134, 150, 140 if hov else 70), 2 if on else 1))
+        p.setBrush(bg if on else pal.color(QPalette.Base))
+        p.drawRoundedRect(r, 14, 14)
+        box, k = QRectF(0, 0, 44, 52), min(44.0 / self.w, 52.0 / self.h)
+        rr = QRectF(0, 0, self.w * k, self.h * k)
+        rr.moveCenter(QPointF(r.center().x(), r.top() + 36))
+        p.setPen(QPen(acc if on else mut, 1.6))
+        fill = QColor(acc if on else mut)
+        fill.setAlpha(60)
+        p.setBrush(fill)
+        p.drawRoundedRect(rr, 4, 4)
+        f = QFont(self.font())
+        f.setPixelSize(13)
+        f.setWeight(QFont.Bold)
+        p.setFont(f)
+        p.setPen(acc if on else txt)
+        p.drawText(QRectF(r.left(), r.top() + 66, r.width(), 18), Qt.AlignCenter, self.ratio)
+        f.setPixelSize(10)
+        f.setWeight(QFont.Normal)
+        p.setFont(f)
+        p.setPen(mut)
+        p.drawText(QRectF(r.left(), r.top() + 84, r.width(), 14), Qt.AlignCenter, self.kind)
+        p.drawText(QRectF(r.left(), r.top() + 97, r.width(), 14), Qt.AlignCenter, f"{self.w}\u00d7{self.h}")
+
+
 class SettingsDialog(QDialog):
     """File > Settings: General (language), Appearance (theme + accent), Version, About (system information)."""
     def __init__(self, parent):
         super().__init__(parent)
         self.setWindowTitle("Settings")
-        self.setFixedSize(560, 430)
+        self.setFixedSize(760, 520)
         c = cfg()
-        lay = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(18, 18, 18, 14)
+        outer.setSpacing(10)
+        row_ = QHBoxLayout()
+        row_.setSpacing(16)
+        outer.addLayout(row_, 1)
+        navw = QFrame()
+        navw.setObjectName("cardSoft")
+        navw.setFixedWidth(180)
+        nl = QVBoxLayout(navw)
+        nl.setContentsMargins(8, 10, 8, 10)
+        nl.setSpacing(2)
+        self.nav_btns = []
+        for k, (nm, ic) in enumerate((("General", "settings"), ("Appearance", "sun"), ("Version", "tips"), ("About", "info"))):
+            b = QPushButton("  " + nm)
+            b.setObjectName("setNav")
+            b.setCheckable(True)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setIcon(QIcon(icon_pixmap(ic, theme_tokens()["muted"], 18)))
+            b.clicked.connect(lambda checked=False, k=k: self.go_to(k))
+            nl.addWidget(b)
+            self.nav_btns.append(b)
+        nl.addStretch()
+        navw.setStyleSheet("QPushButton#setNav { background: transparent; border: none; border-radius: 9px; text-align: left; padding: 9px 10px; "
+                           "font-weight: 600; color: palette(placeholder-text); }"
+                           "QPushButton#setNav:hover { background: palette(alternate-base); color: palette(window-text); }"
+                           "QPushButton#setNav:checked { background: palette(alternate-base); color: palette(highlight); }")
+        row_.addWidget(navw)
         tabs = QTabWidget()
-        lay.addWidget(tabs)
+        tabs.tabBar().hide()
+        tabs.setStyleSheet("QTabWidget::pane { border: none; background: transparent; }")
+        self.tabs = tabs
+        row_.addWidget(tabs, 1)
+        lay = outer
         # General
         g = QWidget()
         gl = QVBoxLayout(g)
-        gl.addWidget(QLabel("Language"))
+        h_ = QLabel("Language")
+        h_.setObjectName("h2")
+        gl.addWidget(h_)
         self.lang = QComboBox()
         self.lang.addItems(LANGUAGES)
         self.lang.setCurrentText(c.value("language", "English"))
         self.lang.currentTextChanged.connect(lambda v: cfg().setValue("language", v))
         gl.addWidget(self.lang)
-        note = QLabel("Your choice is saved. Translated interface text is not part of this beta build yet, so the app still shows English.")
+        note = QLabel("Your choice is saved. Translated interface text is not part of this release yet, so the app still shows English.")
         note.setWordWrap(True)
         gl.addWidget(note)
         gl.addSpacing(8)
-        gl.addWidget(QLabel("Performance"))
+        h2_ = QLabel("Performance")
+        h2_.setObjectName("h2")
+        gl.addWidget(h2_)
         self.gpu = QCheckBox("Use the graphics card (GPU) to draw the canvas")
         self.gpu.setChecked(c.value("gpu", "true") == "true")
         self.gpu.toggled.connect(lambda on: (cfg().setValue("gpu", "true" if on else "false"), cfg().setValue("gpu_guard", "0")))
@@ -4889,16 +5584,38 @@ class SettingsDialog(QDialog):
         # Appearance
         a = QWidget()
         al = QVBoxLayout(a)
-        al.addWidget(QLabel("Theme"))
+        th = QLabel("Theme")
+        th.setObjectName("h2")
+        al.addWidget(th)
+        tr_ = QHBoxLayout()
+        tr_.setSpacing(12)
         self.theme_btns = {}
         for t in ("Dark", "Light"):
-            r = QRadioButton(t)
+            r = ThemeTile(t)
             r.setChecked(c.value("theme", "Dark") == t)
-            r.toggled.connect(lambda on, t=t: on and self.set_theme(t))
+            r.clicked.connect(lambda checked=False, t=t: self.set_theme(t))
             self.theme_btns[t] = r
-            al.addWidget(r)
-        al.addSpacing(10)
-        al.addWidget(QLabel("Accent"))
+            tr_.addWidget(r)
+        tr_.addStretch()
+        al.addLayout(tr_)
+        al.addSpacing(14)
+        ac_ = QLabel("Accent colour")
+        ac_.setObjectName("h2")
+        al.addWidget(ac_)
+        sw = QHBoxLayout()
+        sw.setSpacing(8)
+        for nm, hexc in ACCENT_PRESETS:
+            b = QPushButton()
+            b.setFixedSize(30, 30)
+            b.setToolTip(nm)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setStyleSheet(f"QPushButton {{ background: {hexc}; border: 2px solid transparent; border-radius: 15px; padding: 0; }}"
+                            f"QPushButton:hover {{ border-color: palette(text); }}")
+            b.clicked.connect(lambda checked=False, c=hexc: self.set_accent(c))
+            sw.addWidget(b)
+        sw.addStretch()
+        al.addLayout(sw)
+        al.addSpacing(6)
         row = QHBoxLayout()
         self.accent_btn = QPushButton()
         self.accent_btn.clicked.connect(self.pick_accent)
@@ -4927,12 +5644,18 @@ class SettingsDialog(QDialog):
         self.about_l = QFormLayout(ab)
         tabs.addTab(ab, "About")
         self.about_ready = False
-        tabs.currentChanged.connect(lambda i: i == 3 and self.fill_about())
+        tabs.currentChanged.connect(lambda i: (i == 3 and self.fill_about(), [b.setChecked(n == i) for n, b in enumerate(self.nav_btns)]))
+        self.nav_btns[0].setChecked(True)
         bb = QDialogButtonBox(QDialogButtonBox.Close)
         bb.rejected.connect(self.reject)
         bb.accepted.connect(self.accept)
         bb.button(QDialogButtonBox.Close).clicked.connect(self.accept)
         lay.addWidget(bb)
+
+    def go_to(self, k):
+        self.tabs.setCurrentIndex(k)
+        for n, b in enumerate(self.nav_btns):
+            b.setChecked(n == k)
 
     def fill_about(self):
         if self.about_ready:
@@ -4962,6 +5685,8 @@ class SettingsDialog(QDialog):
     def set_theme(self, t):
         cfg().setValue("theme", t)
         apply_theme(QApplication.instance())
+        for k, b in self.theme_btns.items():
+            b.setChecked(k == t)
 
     def set_accent(self, col):
         cfg().setValue("accent", col)
@@ -5016,22 +5741,31 @@ def default_projects_dir():
 
 
 class NewProjectDialog(QDialog):
-    """Fixed-size window: project name, save location, slide size, number of slides, Create."""
+    """Fixed-size window: project name, save location, slide format (pictures), number of slides, Create."""
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("New Project")
         self.setWindowFlags(Qt.Dialog | Qt.WindowTitleHint | Qt.WindowCloseButtonHint)
         self.info = None
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(26, 22, 26, 22)
+        lay.setContentsMargins(28, 24, 28, 24)
         lay.setSpacing(8)
         self.lay = lay
-        lay.addWidget(self.head("Name of the project"))
+        h1 = QLabel("New project")
+        h1.setObjectName("h1")
+        h1.setStyleSheet("font-size: 24px;")
+        lay.addWidget(h1)
+        sub = QLabel("Name it, choose a slide format and how many slides you need. You can change both later.")
+        sub.setObjectName("sub")
+        sub.setWordWrap(True)
+        lay.addWidget(sub)
+        lay.addSpacing(10)
+        lay.addWidget(self.head("Project name"))
         self.name = QLineEdit("Untitled")
         self.name.textChanged.connect(self.check)
         lay.addWidget(self.name)
         lay.addSpacing(6)
-        lay.addWidget(self.head("Location"))
+        lay.addWidget(self.head("Save to"))
         row = QHBoxLayout()
         self.loc = QLineEdit(default_projects_dir())
         self.loc.textChanged.connect(self.check)
@@ -5041,30 +5775,44 @@ class NewProjectDialog(QDialog):
         row.addWidget(b)
         lay.addLayout(row)
         lay.addSpacing(6)
-        lay.addWidget(self.head("Size"))
+        lay.addWidget(self.head("Slide format"))
+        tiles = QHBoxLayout()
+        tiles.setSpacing(8)
         self.radios = []
-        for i, (label, (w, h)) in enumerate(NEW_SIZES):
-            r = QRadioButton(f"{label}      {w} x {h}")
+        grp = QButtonGroup(self)
+        grp.setExclusive(True)
+        for i, (label, sz) in enumerate(NEW_SIZES):
+            r = SizeTile(label, sz)
             r.setChecked(i == 0)
+            grp.addButton(r)
             self.radios.append(r)
-            lay.addWidget(r)
+            tiles.addWidget(r)
+        lay.addLayout(tiles)
         lay.addSpacing(6)
         row = QHBoxLayout()
-        row.addWidget(self.head("Number of slides"))
+        col = QVBoxLayout()
+        col.setSpacing(0)
+        col.addWidget(self.head("Number of slides"))
+        hint = QLabel("A carousel can have up to 20 slides")
+        hint.setObjectName("sub")
+        col.addWidget(hint)
+        row.addLayout(col)
         row.addStretch()
         self.n = QSpinBox()
         self.n.setRange(1, 20)
         self.n.setValue(3)
+        self.n.setFixedWidth(96)
         row.addWidget(self.n)
         lay.addLayout(row)
-        lay.addSpacing(8)
+        lay.addSpacing(10)
         self.msg = QLabel("")
         self.msg.setStyleSheet("color: #ff6b6b;")
         self.msg.setWordWrap(True)
         self.msg.hide()
         lay.addWidget(self.msg)
-        self.create = QPushButton("Create")
+        self.create = QPushButton("Create project")
         self.create.setObjectName("primary")
+        self.create.setMinimumHeight(40)
         self.create.setDefault(True)
         self.create.clicked.connect(self.make)
         lay.addWidget(self.create)
@@ -5072,7 +5820,7 @@ class NewProjectDialog(QDialog):
 
     def fit(self):
         """Exactly as tall as its content (no empty space); the message line only takes room when shown."""
-        self.setFixedSize(480, self.lay.sizeHint().height())
+        self.setFixedSize(560, self.lay.sizeHint().height())
 
     @staticmethod
     def head(t):
@@ -5142,69 +5890,173 @@ def glyph_icon(kind, color, size=24):
     return pm
 
 
-class CardButton(QPushButton):
-    """Big rounded action card: round icon, bold title, small description."""
+def icon_pixmap(name, color, size=24):
+    pm = QPixmap(size * 2, size * 2)
+    pm.fill(Qt.transparent)
+    pp = QPainter(pm)
+    draw_ui_icon(pp, name, color, size * 2)
+    pp.end()
+    pm.setDevicePixelRatio(2)
+    return pm
+
+
+def rel_time(ts):
+    """'Edited 3 hours ago' style text for the recent project cards."""
+    d = max(0, time.time() - ts)
+    if d < 90:
+        return "Just now"
+    if d < 3600:
+        return f"{int(d // 60)} min ago"
+    if d < 86400:
+        return f"{int(d // 3600)} h ago"
+    if d < 172800:
+        return "Yesterday"
+    if d < 86400 * 30:
+        return f"{int(d // 86400)} days ago"
+    return time.strftime("%d %b %Y", time.localtime(ts))
+
+
+class ActionCard(QPushButton):
+    """Big action tile on the start screen: round icon, title, one line of help."""
     def __init__(self, kind, title, sub, hero=False):
         super().__init__()
         self.setObjectName("cardHero" if hero else "card")
         self.setCursor(Qt.PointingHandCursor)
-        self.setMinimumHeight(86)
+        self.setMinimumHeight(88)
         row = QHBoxLayout(self)
-        row.setContentsMargins(20, 14, 20, 14)
-        row.setSpacing(16)
+        row.setContentsMargins(18, 14, 18, 14)
+        row.setSpacing(14)
+        t = theme_tokens()
         ic = QLabel()
         ic.setFixedSize(44, 44)
         ic.setAlignment(Qt.AlignCenter)
         ic.setObjectName("cardIconHero" if hero else "cardIcon")
-        ic.setPixmap(glyph_icon(kind, "#15161b" if hero else "#ffffff", 22))
+        ic.setPixmap(icon_pixmap(kind, t["accent_text"] if hero else t["accent"], 22))
         col = QVBoxLayout()
-        col.setSpacing(2)
+        col.setSpacing(1)
         col.addStretch()
-        t = QLabel(title)
-        t.setObjectName("cardTitle")
+        tl = QLabel(title)
+        tl.setObjectName("cardTitle")
         sb = QLabel(sub)
         sb.setObjectName("cardSub")
-        col.addWidget(t)
+        col.addWidget(tl)
         col.addWidget(sb)
         col.addStretch()
         row.addWidget(ic)
         row.addLayout(col, 1)
-        for w in (ic, t, sb):
+        for w in (ic, tl, sb):
             w.setAttribute(Qt.WA_TransparentForMouseEvents)
 
 
+class RecentCard(QPushButton):
+    """One recent project: picture, name, when it was last edited. Right-click for Open / Remove."""
+    W, H = 206, 190
+
+    def __init__(self, path, pm, when):
+        super().__init__()
+        self.path = path
+        self.setObjectName("rcard")
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedSize(self.W, self.H)
+        self.setToolTip(str(path))
+        v = QVBoxLayout(self)
+        v.setContentsMargins(8, 8, 8, 10)
+        v.setSpacing(1)
+        img = QLabel()
+        img.setFixedSize(190, 107)
+        img.setPixmap(pm)
+        img.setAttribute(Qt.WA_TransparentForMouseEvents)
+        nm = QLabel(QFontMetricsF(self.font()).elidedText(Path(path).stem, Qt.ElideRight, 176))
+        nm.setObjectName("rname")
+        dt = QLabel(when)
+        dt.setObjectName("rdate")
+        for w in (nm, dt):
+            w.setAttribute(Qt.WA_TransparentForMouseEvents)
+        v.addWidget(img)
+        v.addSpacing(6)
+        v.addWidget(nm)
+        v.addWidget(dt)
+        v.addStretch()
+
+
+class TemplateCard(QPushButton):
+    """A template on the start screen (all its slides side by side)."""
+    def __init__(self, t, pm):
+        super().__init__()
+        self.t = t
+        self.setObjectName("rcard")
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedSize(278, 156)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(8, 8, 8, 10)
+        v.setSpacing(1)
+        img = QLabel()
+        img.setFixedSize(262, 94)
+        img.setAlignment(Qt.AlignCenter)
+        img.setObjectName("tplImg")
+        if pm is not None:
+            img.setPixmap(pm)
+        img.setAttribute(Qt.WA_TransparentForMouseEvents)
+        nm = QLabel(t["name"])
+        nm.setObjectName("rname")
+        dt = QLabel(f"{t['n']} slides  \u00b7  {t['pw']} \u00d7 {t['ph']}")
+        dt.setObjectName("rdate")
+        for w in (nm, dt):
+            w.setAttribute(Qt.WA_TransparentForMouseEvents)
+        v.addWidget(img)
+        v.addSpacing(6)
+        v.addWidget(nm)
+        v.addWidget(dt)
+        v.addStretch()
+
+
 class StartScreen(QDialog):
-    """Shown before the editor opens: New project, Open project, Templates and the Recent projects list."""
+    """Shown before the editor opens: a sidebar (new, open, templates, settings), big action cards, recent projects
+    and a few templates to start from."""
     @staticmethod
     def make_style():
         t = theme_tokens()
-        hero_bg = "#ffffff" if t["dark"] else "#16161a"
-        hero_fg = "#111114" if t["dark"] else "#ffffff"
         q = """
-        * { font-family: "Helvetica Neue", Helvetica, Arial, sans-serif; font-weight: 700; }
         QDialog { background: @bg@; }
-        QLabel#title { color: @text@; font-size: 38px; }
-        QLabel#badge { color: @accent_text@; background: @accent@; border-radius: 9px; padding: 3px 10px; font-size: 11px; }
-        QLabel#intro { color: @muted@; font-size: 14px; font-weight: 500; }
-        QLabel#head { color: @text@; font-size: 18px; }
-        QLabel#emptybox { color: @muted@; font-size: 14px; font-weight: 500; background: transparent; }
-        QFrame#recentCard { background: @panel@; border: 1px solid @border@; border-radius: 18px; }
-        QPushButton#card, QPushButton#cardHero { background: @panel@; border: 1px solid @border@; border-radius: 18px; text-align: left; padding: 0; }
-        QPushButton#card:hover { background: @hover@; border-color: @border2@; }
-        QPushButton#cardHero { background: @herobg@; border-color: @herobg@; }
-        QPushButton#cardHero:hover { background: @herohover@; border-color: @herohover@; }
-        QLabel#cardTitle { color: @text@; font-size: 16px; }
-        QLabel#cardSub { color: @muted@; font-size: 12px; font-weight: 500; }
-        QPushButton#cardHero QLabel#cardTitle { color: @herofg@; }
-        QPushButton#cardHero QLabel#cardSub { color: #55555f; }
-        QLabel#cardIcon { background: @press@; border-radius: 22px; }
-        QLabel#cardIconHero { background: #e6e6ec; border-radius: 22px; }
-        QPushButton#link { background: transparent; border: none; color: @muted@; padding: 4px; font-size: 12px; }
-        QPushButton#link:hover { color: @text@; }
-        QListWidget { background: transparent; border: none; font-size: 13px; }
-        QListWidget::item { padding: 8px; border-radius: 10px; }
+        QFrame#sidebar { background: @panel@; border: none; border-right: 1px solid @border@; border-radius: 0; }
+        QLabel#brand { color: @text@; font-size: 20px; font-weight: 800; }
+        QLabel#badge { color: @accent@; background: @accent_soft@; border-radius: 8px; padding: 2px 8px; font-size: 10px; font-weight: 800; }
+        QPushButton#navItem { background: transparent; border: none; border-radius: 9px; text-align: left; padding: 10px 12px;
+            color: @muted@; font-size: 13px; font-weight: 600; }
+        QPushButton#navItem:hover { background: @hover@; color: @text@; }
+        QPushButton#navItem:checked { background: @accent_soft@; color: @accent@; }
+        QLabel#navCap { color: @muted@; font-size: 10px; font-weight: 800; letter-spacing: 1.5px; padding: 16px 12px 4px 12px; }
+        QLabel#ver { color: @muted@; font-size: 11px; }
+        QLabel#title { color: @text@; font-size: 32px; font-weight: 800; }
+        QLabel#intro { color: @muted@; font-size: 14px; }
+        QLabel#head { color: @text@; font-size: 16px; font-weight: 700; }
+        QLabel#emptybox { color: @muted@; font-size: 13px; background: transparent; }
+        QLabel#emptytitle { color: @text@; font-size: 15px; font-weight: 700; background: transparent; }
+        QFrame#emptyCard { background: transparent; border: 1px dashed @border2@; border-radius: 14px; }
+        QPushButton#card, QPushButton#cardHero { background: @panel@; border: 1px solid @border@; border-radius: 14px; text-align: left; padding: 0; }
+        QPushButton#card:hover { background: @hover@; border-color: @accent@; }
+        QPushButton#cardHero { border: none;
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 @accent@, stop:1 @accent2@); }
+        QPushButton#cardHero:hover { background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 @accent_hover@, stop:1 @accent2@); }
+        QLabel#cardTitle { color: @text@; font-size: 16px; font-weight: 700; background: transparent; }
+        QLabel#cardSub { color: @muted@; font-size: 12px; background: transparent; }
+        QPushButton#cardHero QLabel#cardTitle, QPushButton#cardHero QLabel#cardSub { color: @accent_text@; }
+        QLabel#cardIcon { background: @accent_soft@; border-radius: 12px; }
+        QLabel#cardIconHero { background: rgba(255, 255, 255, 0.24); border-radius: 12px; }
+        QPushButton#rcard { background: @panel@; border: 1px solid @border@; border-radius: 14px; text-align: left; padding: 0; }
+        QPushButton#rcard:hover { background: @hover@; border-color: @accent@; }
+        QLabel#rname { color: @text@; font-size: 13px; font-weight: 700; background: transparent; }
+        QLabel#rdate { color: @muted@; font-size: 11px; background: transparent; }
+        QLabel#tplImg { background: @field@; border-radius: 9px; }
+        QPushButton#link { background: transparent; border: none; color: @muted@; padding: 4px 6px; font-size: 12px; font-weight: 600; }
+        QPushButton#link:hover { color: @accent@; }
+        QScrollArea { background: transparent; border: none; }
+        QWidget#mainBody { background: transparent; }
+        QFrame#stepsCard { background: @panel@; border: 1px solid @border@; border-radius: 14px; }
+        QLabel#stepNum { color: @accent@; background: @accent_soft@; border-radius: 11px; font-size: 11px; font-weight: 800; }
+        QLabel#stepText { color: @text@; font-size: 12px; background: transparent; }
+        QLabel#stepSub { color: @muted@; font-size: 11px; background: transparent; }
         """
-        t = dict(t, herobg=hero_bg, herofg=hero_fg, herohover="#e4e4ea" if t["dark"] else "#2b2b31")
         for k, v in sorted(t.items(), key=lambda kv: -len(kv[0])):
             if isinstance(v, str):
                 q = q.replace(f"@{k}@", v)
@@ -5215,82 +6067,286 @@ class StartScreen(QDialog):
         self.main, self.result_action = main, None
         self.setWindowTitle(APP_NAME)
         self.setStyleSheet(self.make_style())
-        self.setFixedSize(1000, 660)
+        self.setFixedSize(1180, 780)
         self.setWindowFlags(Qt.Window | Qt.WindowTitleHint | Qt.WindowSystemMenuHint | Qt.WindowMinimizeButtonHint | Qt.WindowCloseButtonHint)
-        root = QVBoxLayout(self)
-        root.setContentsMargins(52, 44, 52, 30)
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        t = theme_tokens()
+        # ---------------- sidebar
+        side = QFrame()
+        side.setObjectName("sidebar")
+        side.setFixedWidth(240)
+        sl = QVBoxLayout(side)
+        sl.setContentsMargins(16, 24, 16, 18)
+        sl.setSpacing(2)
+        brand = QHBoxLayout()
+        brand.setSpacing(10)
+        logo = QLabel()
+        logo.setFixedSize(40, 40)
+        icon_file = resource_path("assets", "aero_icon_256.png")
+        if os.path.exists(icon_file):
+            lp = QPixmap(icon_file).scaled(80, 80, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            lp.setDevicePixelRatio(2)
+            logo.setPixmap(lp)
+        brand.addWidget(logo)
+        bn = QLabel(APP_NAME)
+        bn.setObjectName("brand")
+        brand.addWidget(bn)
+        brand.addStretch()
+        sl.addLayout(brand)
+        sl.addSpacing(14)
+
+        def nav(kind, text, fn, checked=False):
+            b = QPushButton("   " + text)
+            b.setObjectName("navItem")
+            b.setCheckable(True)
+            b.setChecked(checked)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setIcon(QIcon(icon_pixmap(kind, t["accent"] if checked else t["muted"], 20)))
+            b.setIconSize(QSize(20, 20))
+            b.clicked.connect(lambda c=False: (b.setChecked(checked), fn()))
+            return b
+        sl.addWidget(nav("home", "Home", lambda: None, True))
+        sl.addWidget(nav("plus", "New project", self.new))
+        sl.addWidget(nav("folder", "Open project", self.open))
+        sl.addWidget(nav("template", "Templates", self.template))
+        cap = QLabel("MORE")
+        cap.setObjectName("navCap")
+        sl.addWidget(cap)
+        sl.addWidget(nav("settings", "Settings", self.settings))
+        sl.addWidget(nav("tips", "Quick tips", self.tips))
+        sl.addWidget(nav("info", "About Aero", self.about))
+        sl.addStretch()
+        v0 = QLabel("Aero version " + APP_VERSION)
+        v0.setObjectName("ver")
+        sl.addWidget(v0)
+        for txt in VERSION_LINES[1:]:
+            v = QLabel(txt)
+            v.setObjectName("ver")
+            sl.addWidget(v)
+        outer.addWidget(side)
+        # ---------------- main column (scrolls on small screens)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        body = QWidget()
+        body.setObjectName("mainBody")
+        scroll.setWidget(body)
+        outer.addWidget(scroll, 1)
+        root = QVBoxLayout(body)
+        root.setContentsMargins(36, 24, 36, 16)
         root.setSpacing(0)
-        row = QHBoxLayout()
-        t = QLabel("Welcome to " + APP_NAME)
-        t.setObjectName("title")
-        bd = QLabel("BETA")
-        bd.setObjectName("badge")
-        row.addWidget(t)
-        row.addSpacing(10)
-        row.addWidget(bd, 0, Qt.AlignVCenter)
-        row.addStretch()
-        root.addLayout(row)
+        h1 = QLabel("Welcome to " + APP_NAME)
+        h1.setObjectName("title")
+        root.addWidget(h1)
+        root.addSpacing(6)
         intro = QLabel("Welcome to Aero, an editor built for Instagram, Threads, and Facebook Album creation. Content purpose-built social media design platform made specifically for creators.")
         intro.setObjectName("intro")
         intro.setWordWrap(True)
-        root.addSpacing(10)
         root.addWidget(intro)
-        root.addSpacing(26)
+        root.addSpacing(16)
         cards = QHBoxLayout()
-        cards.setSpacing(16)
-        for kind, title, sub, fn, hero in (("plus", "New Project", "Pick a slide size and count", self.new, True),
-                                           ("folder", "Open Project", "Continue a saved project", self.open, False),
-                                           ("grid", "Start from a Template", "Ready-made carousel layouts", self.template, False)):
-            c = CardButton(kind, title, sub, hero)
+        cards.setSpacing(14)
+        for kind, title, sub, fn, hero in (("plus", "New project", "Pick a slide size and count", self.new, True),
+                                           ("folder", "Open project", "Continue a saved project", self.open, False),
+                                           ("template", "Templates", "Ready-made carousel layouts", self.template, False)):
+            c = ActionCard(kind, title, sub, hero)
             c.clicked.connect(fn)
             cards.addWidget(c, 1)
         root.addLayout(cards)
-        root.addSpacing(34)
+        root.addSpacing(14)
+        steps = QFrame()
+        steps.setObjectName("stepsCard")
+        stl = QHBoxLayout(steps)
+        stl.setContentsMargins(16, 9, 16, 9)
+        stl.setSpacing(18)
+        for n_, (a_, b_) in enumerate((("Create", "pick size and slide count"), ("Add", "photos, video and text"),
+                                       ("Drag across", "the pink lines to join slides"), ("Export", "every slide saved in order")), 1):
+            cell = QHBoxLayout()
+            cell.setSpacing(9)
+            nl = QLabel(str(n_))
+            nl.setObjectName("stepNum")
+            nl.setFixedSize(22, 22)
+            nl.setAlignment(Qt.AlignCenter)
+            tx = QVBoxLayout()
+            tx.setSpacing(0)
+            l1, l2 = QLabel(a_), QLabel(b_)
+            l1.setObjectName("stepText")
+            l1.setStyleSheet("font-weight: 700;")
+            l2.setObjectName("stepSub")
+            tx.addWidget(l1)
+            tx.addWidget(l2)
+            cell.addWidget(nl)
+            cell.addLayout(tx)
+            stl.addLayout(cell, 1)
+        root.addWidget(steps)
+        root.addSpacing(20)
+        hr = QHBoxLayout()
         h = QLabel("Recent projects")
         h.setObjectName("head")
-        root.addWidget(h)
-        root.addSpacing(12)
-        card = QFrame()
-        card.setObjectName("recentCard")
-        cl = QVBoxLayout(card)
-        cl.setContentsMargins(14, 14, 14, 14)
-        self.lst = QListWidget()
-        self.lst.setIconSize(QSize(150, 84))
-        self.lst.itemDoubleClicked.connect(self.open_recent)
-        cl.addWidget(self.lst, 1)
-        self.empty_icon = QLabel()
-        self.empty_icon.setPixmap(glyph_icon("image", theme_tokens()["muted"], 40))
-        self.empty_icon.setAlignment(Qt.AlignCenter)
-        self.empty = QLabel("Your recent projects appear here.\nNew to this? Don't worry, this is designed and made to be easy")
-        self.empty.setObjectName("emptybox")
-        self.empty.setAlignment(Qt.AlignCenter)
-        self.empty.setWordWrap(True)
-        cl.addStretch()
-        cl.addWidget(self.empty_icon)
-        cl.addSpacing(8)
-        cl.addWidget(self.empty)
-        cl.addStretch()
-        root.addWidget(card, 1)
-        clr = QPushButton("Clear list")
-        clr.setObjectName("link")
-        clr.setCursor(Qt.PointingHandCursor)
-        clr.clicked.connect(self.clear_recent)
-        root.addWidget(clr, 0, Qt.AlignRight)
+        hr.addWidget(h)
+        hr.addStretch()
+        self.show_all = QPushButton("Show all")
+        self.show_all.setObjectName("link")
+        self.show_all.setCursor(Qt.PointingHandCursor)
+        self.show_all.clicked.connect(self.toggle_all)
+        hr.addWidget(self.show_all)
+        self.clr = QPushButton("Clear list")
+        self.clr.setObjectName("link")
+        self.clr.setCursor(Qt.PointingHandCursor)
+        self.clr.clicked.connect(self.clear_recent)
+        hr.addWidget(self.clr)
+        root.addLayout(hr)
+        root.addSpacing(10)
+        self.recent_grid = QGridLayout()
+        self.recent_grid.setHorizontalSpacing(14)
+        self.recent_grid.setVerticalSpacing(14)
+        self.recent_grid.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        root.addLayout(self.recent_grid)
+        self.empty = QFrame()
+        self.empty.setObjectName("emptyCard")
+        el = QVBoxLayout(self.empty)
+        el.setContentsMargins(20, 26, 20, 26)
+        el.setSpacing(4)
+        ei = QLabel()
+        ei.setPixmap(icon_pixmap("image", t["muted"], 36))
+        ei.setAlignment(Qt.AlignCenter)
+        et = QLabel("No projects yet")
+        et.setObjectName("emptytitle")
+        et.setAlignment(Qt.AlignCenter)
+        eb = QLabel("Your recent projects appear here.\nNew to this? Don't worry, this is designed and made to be easy.")
+        eb.setObjectName("emptybox")
+        eb.setAlignment(Qt.AlignCenter)
+        for w in (ei, et, eb):
+            el.addWidget(w)
+        root.addWidget(self.empty)
+        root.addSpacing(20)
+        tr = QHBoxLayout()
+        th = QLabel("Start from a template")
+        th.setObjectName("head")
+        tr.addWidget(th)
+        tr.addStretch()
+        more = QPushButton("Browse all templates")
+        more.setObjectName("link")
+        more.setCursor(Qt.PointingHandCursor)
+        more.clicked.connect(self.template)
+        tr.addWidget(more)
+        root.addLayout(tr)
+        root.addSpacing(10)
+        self.tpl_row = QHBoxLayout()
+        self.tpl_row.setSpacing(14)
+        self.tpl_row.addStretch()
+        root.addLayout(self.tpl_row)
+        root.addStretch()
+        self.refill()
+        QTimer.singleShot(60, self.load_templates)
+
+    def load_templates(self):
+        """A few template pictures along the bottom (drawn after the window is up, so it opens instantly)."""
+        seen, picks = set(), []
+        for tpl in TEMPLATES:
+            if tpl["cat"] not in seen:
+                seen.add(tpl["cat"])
+                picks.append(tpl)
+            if len(picks) == 3:
+                break
+        while self.tpl_row.count() > 1:
+            it = self.tpl_row.takeAt(0)
+            if it.widget():
+                it.widget().deleteLater()
+        for tpl in picks:
+            try:
+                pm = self.main.template_pixmap(tpl, H=190).scaled(524, 188, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                pm.setDevicePixelRatio(2)
+            except Exception:
+                pm = None
+            c = TemplateCard(tpl, pm)
+            c.clicked.connect(lambda checked=False, t_=tpl: self.finish(("template", t_)))
+            self.tpl_row.insertWidget(self.tpl_row.count() - 1, c)
+
+    def tips(self):
+        QMessageBox.information(self, "Quick tips", "1. Click New project, choose a slide size and how many slides.\n"
+                                "2. Add photos, videos and text from the tool bar on the left.\n"
+                                "3. Drag a photo across the pink dashed lines: it continues into the next slide.\n"
+                                "4. Double-click text to edit. Right-click anything for more options.\n"
+                                "5. Press Export when you are done: every slide is saved in order.")
+
+    def settings(self):
+        SettingsDialog(self.main).exec()
+        self.restyle()
+
+    def about(self):
+        d = SettingsDialog(self.main)
+        d.go_to(3)
+        d.exec()
+        self.restyle()
+
+    def restyle(self):
+        self.setStyleSheet(self.make_style())
+
+    def card_menu(self, card, pos):
+        m = QMenu(self)
+        m.addAction("Open", lambda: self.finish(("open", card.path)))
+        m.addAction("Remove from list", lambda: self.remove_recent(card.path))
+        m.exec(card.mapToGlobal(pos))
+
+    def remove_recent(self, path):
+        cur = [x for x in recent_projects() if Path(x) != Path(path)]
+        QSettings("AeroPhotoEditor", "Editor").setValue("recent", cur)
         self.refill()
 
+    @staticmethod
+    def thumb_icon(tp, W=400, H=224, r=18):
+        """Project picture cropped to a 16:9 card with rounded corners."""
+        src = QPixmap(str(tp))
+        if src.isNull():
+            return placeholder_icon()
+        src = src.scaled(W, H, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+        out = QPixmap(W, H)
+        out.fill(Qt.transparent)
+        p = QPainter(out)
+        p.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(0, 0, W, H), r, r)
+        p.setClipPath(path)
+        p.drawPixmap((W - src.width()) // 2, (H - src.height()) // 2, src)
+        p.setClipping(False)
+        p.setPen(QPen(QColor(128, 128, 140, 70), 2))
+        p.drawRoundedRect(QRectF(1, 1, W - 2, H - 2), r, r)
+        p.end()
+        return QIcon(out)
+
     def refill(self):
-        self.lst.clear()
+        while self.recent_grid.count():
+            it = self.recent_grid.takeAt(0)
+            if it.widget():
+                it.widget().deleteLater()
         rec = recent_projects()
-        for pth in rec:
+        self.recent_all = getattr(self, "recent_all", False)
+        shown = rec if self.recent_all else rec[:4]
+        self.show_all.setVisible(len(rec) > 4)
+        self.show_all.setText("Show fewer" if self.recent_all else f"Show all ({len(rec)})")
+        for n, pth in enumerate(shown):
             tp = thumb_path(pth)
-            li = QListWidgetItem(QIcon(str(tp)) if tp.exists() else placeholder_icon(),
-                                 f"{Path(pth).stem}\n{Path(pth).parent}")
-            li.setSizeHint(QSize(0, 100))
-            li.setData(Qt.UserRole, pth)
-            self.lst.addItem(li)
+            ic = self.thumb_icon(tp, 380, 214, 20) if tp.exists() else placeholder_icon()
+            pm = ic.pixmap(380, 214).scaled(380, 214, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+            pm.setDevicePixelRatio(2)
+            try:
+                when = "Edited " + rel_time(Path(pth).stat().st_mtime)
+            except OSError:
+                when = ""
+            c = RecentCard(pth, pm, when)
+            c.clicked.connect(lambda checked=False, p_=pth: self.finish(("open", p_)))
+            c.setContextMenuPolicy(Qt.CustomContextMenu)
+            c.customContextMenuRequested.connect(lambda pos, c=c: self.card_menu(c, pos))
+            self.recent_grid.addWidget(c, n // 4, n % 4)
         self.empty.setVisible(not rec)
-        self.empty_icon.setVisible(not rec)
-        self.lst.setVisible(bool(rec))
+        self.clr.setVisible(bool(rec))
+
+    def toggle_all(self):
+        self.recent_all = not getattr(self, "recent_all", False)
+        self.refill()
 
     def clear_recent(self):
         QSettings("AeroPhotoEditor", "Editor").setValue("recent", [])
@@ -5310,9 +6366,6 @@ class StartScreen(QDialog):
         if path:
             self.finish(("open", path))
 
-    def open_recent(self, li):
-        self.finish(("open", li.data(Qt.UserRole)))
-
     def template(self):
         d = TemplatesDialog(self.main, self)
         if d.exec() and d.chosen:
@@ -5330,11 +6383,153 @@ class StartScreen(QDialog):
             w.apply_template(a[1], ask=False)
 
 
+class ClickRow(QFrame):
+    clicked = Signal()
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.LeftButton and self.rect().contains(e.position().toPoint()):
+            self.clicked.emit()
+        super().mouseReleaseEvent(e)
+
+
+class Section(QWidget):
+    """Collapsible inspector section: small-caps title with a chevron on the right, the controls below it."""
+    def __init__(self, title, expanded=True):
+        super().__init__()
+        self.title, self.on = title, expanded
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
+        self.head = ClickRow()
+        self.head.setObjectName("secHeadRow")
+        self.head.setCursor(Qt.PointingHandCursor)
+        hl = QHBoxLayout(self.head)
+        hl.setContentsMargins(0, 12, 0, 8)
+        self.lab = QLabel(title.upper().replace("&&", "&"))
+        self.lab.setObjectName("secTitle")
+        self.chev = QLabel()
+        hl.addWidget(self.lab)
+        hl.addStretch()
+        hl.addWidget(self.chev)
+        self.body = QWidget()
+        self.body.setObjectName("plainBody")
+        self.body.setStyleSheet("QWidget#plainBody { background: transparent; }")
+        self.bl = QVBoxLayout(self.body)
+        self.bl.setContentsMargins(0, 0, 0, 14)
+        self.bl.setSpacing(8)
+        line = QFrame()
+        line.setObjectName("secLine")
+        line.setFrameShape(QFrame.HLine)
+        v.addWidget(self.head)
+        v.addWidget(self.body)
+        v.addWidget(line)
+        self.head.clicked.connect(lambda: self.toggle(not self.on))
+        self.toggle(expanded)
+
+    def toggle(self, on):
+        self.on = on
+        self.body.setVisible(on)
+        self.refresh_chev()
+
+    def refresh_chev(self):
+        self.chev.setPixmap(icon_pixmap("chevd" if self.on else "chevr", theme_tokens()["muted"], 16))
+
+
+class LayerDelegate(QStyledItemDelegate):
+    """One row of the Layers list: picture, name, kind and size, lock and eye buttons."""
+    H = 58
+
+    @staticmethod
+    def parts(r):
+        eye = QRectF(r.right() - 36, r.center().y() - 14, 28, 28)
+        lock = QRectF(r.right() - 68, r.center().y() - 14, 28, 28)
+        return eye, lock
+
+    def sizeHint(self, option, index):
+        return QSize(option.rect.width(), self.H)
+
+    def paint(self, p, option, index):
+        pal = QApplication.palette()
+        text, muted, acc = pal.color(QPalette.WindowText), pal.color(QPalette.PlaceholderText), pal.color(QPalette.Highlight)
+        r = QRectF(option.rect).adjusted(2, 2, -2, -2)
+        hidden, locked = bool(index.data(Qt.UserRole + 2)), bool(index.data(Qt.UserRole + 3))
+        p.save()
+        p.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
+        sel, hov = bool(option.state & QStyle.State_Selected), bool(option.state & QStyle.State_MouseOver)
+        if sel or hov:
+            bg = QColor(acc)
+            bg.setAlpha(46 if sel else 0)
+            p.setPen(QPen(QColor(acc.red(), acc.green(), acc.blue(), 150), 1) if sel else Qt.NoPen)
+            p.setBrush(bg if sel else pal.color(QPalette.AlternateBase))
+            p.drawRoundedRect(r, 11, 11)
+        th = QRectF(r.left() + 8, r.center().y() - 20, 40, 40)
+        ic = index.data(Qt.DecorationRole)
+        if isinstance(ic, QIcon):
+            pm = ic.pixmap(80, 80)
+            clip = QPainterPath()
+            clip.addRoundedRect(th, 9, 9)
+            p.save()
+            p.setClipPath(clip)
+            p.setOpacity(0.4 if hidden else 1.0)
+            p.drawPixmap(th, pm, QRectF(pm.rect()))
+            p.restore()
+            p.setPen(QPen(QColor(128, 128, 140, 60), 1))
+            p.setBrush(Qt.NoBrush)
+            p.drawRoundedRect(th, 9, 9)
+        f = QFont(option.font)
+        f.setPixelSize(13)
+        f.setWeight(QFont.DemiBold)
+        p.setFont(f)
+        p.setPen(muted if hidden else text)
+        tx = QRectF(th.right() + 12, r.top() + 9, r.width() - 140, 20)
+        p.drawText(tx, Qt.AlignLeft | Qt.AlignVCenter, QFontMetricsF(f).elidedText(index.data(Qt.DisplayRole) or "", Qt.ElideRight, tx.width()))
+        f.setPixelSize(11)
+        f.setWeight(QFont.Normal)
+        p.setFont(f)
+        p.setPen(muted)
+        p.drawText(QRectF(th.right() + 12, r.top() + 29, r.width() - 140, 18), Qt.AlignLeft | Qt.AlignVCenter, index.data(Qt.UserRole + 1) or "")
+        eye, lock = self.parts(r)
+        for rect, name, on in ((lock, "lock", locked), (eye, "eyeoff" if hidden else "eye", True)):
+            if name == "lock" and not locked and not (hov or sel):
+                continue
+            col = QColor(acc) if (name == "lock" and locked) else QColor(muted if (name != "lock" or not locked) else text)
+            if name == "lock" and not locked:
+                col.setAlpha(110)
+            p.save()
+            p.translate(rect.topLeft() + QPointF(5, 5))
+            draw_ui_icon(p, name, col, 18)
+            p.restore()
+        p.restore()
+
+
+class LayerClicks(QObject):
+    """Clicks on the lock / eye buttons inside the Layers list (the list itself keeps selecting and dragging rows)."""
+    def __init__(self, view, on_eye, on_lock):
+        super().__init__(view)
+        self.view, self.on_eye, self.on_lock = view, on_eye, on_lock
+        view.viewport().installEventFilter(self)
+
+    def eventFilter(self, obj, ev):
+        if ev.type() == QEvent.Type.MouseButtonPress and ev.button() == Qt.LeftButton:
+            idx = self.view.indexAt(ev.position().toPoint())
+            if idx.isValid():
+                r = QRectF(self.view.visualRect(idx)).adjusted(2, 2, -2, -2)
+                eye, lock = LayerDelegate.parts(r)
+                pt = ev.position()
+                if eye.contains(pt):
+                    self.on_eye(idx.data(Qt.UserRole))
+                    return True
+                if lock.contains(pt):
+                    self.on_lock(idx.data(Qt.UserRole))
+                    return True
+        return False
+
+
 class Main(QMainWindow):
     def __init__(self):
         super().__init__()
         self.resize(1300, 800)
-        self.setContentsMargins(10, 0, 10, 10)
+        self.setContentsMargins(0, 0, 0, 0)
         self.scene = Canvas()
         self.scene.on_change = self.commit
         self.scene.on_transform = lambda: self.sync_controls(False)
@@ -5357,17 +6552,24 @@ class Main(QMainWindow):
         self.scene.on_shape_edit = self.shape_panel
         self._build_menus()
         self._build_toolbar()
+        self._build_float_bar()
         self._build_side_panel()
         self._build_layers_dock()
         self.crop_panel = CropPanel(self)                      # appears in the right panel only while cropping
         self.crop_dock = QDockWidget("Crop image", self)
         self.crop_dock.setWidget(self.crop_panel)
         self.crop_dock.setFeatures(QDockWidget.NoDockWidgetFeatures)
+        self.crop_dock.setTitleBarWidget(self._dock_head("Crop")[0])
+        self.crop_panel.setObjectName("panelBody")
         self.addDockWidget(Qt.RightDockWidgetArea, self.crop_dock)
         self.tabifyDockWidget(self.side_dock, self.crop_dock)
         self.crop_dock.hide()
         self.scene.selectionChanged.connect(self.sync_controls)
         self.reset_history(DEFAULT)
+        self.resizeDocks([self.side_dock, self.layers_dock], [400, 400], Qt.Vertical)
+        self.resizeDocks([self.side_dock], [330], Qt.Horizontal)
+        self.update_status()
+        self.sync_controls(False)
         self.fit()
 
     # ---------- UI ----------
@@ -5397,7 +6599,10 @@ class Main(QMainWindow):
                 self._act(sub, label, lambda checked=False, f=fn, k=key: f(k))
 
     def _build_menus(self):
-        m = self.menuBar().addMenu("&File")
+        self.mbar = QMenuBar()
+        self.mbar.setObjectName("mbar")
+        self.mbar.setNativeMenuBar(False)
+        m = self.mbar.addMenu("&File")
         self._act(m, "New", self.new_project, QKeySequence.New)
         self._act(m, "Open...", self.open_project, QKeySequence.Open)
         self.recent_menu = m.addMenu("Open Recent")
@@ -5409,13 +6614,13 @@ class Main(QMainWindow):
         self._act(m, "Export...", self.export)
         m.addSeparator()
         self._act(m, "Settings...", lambda: SettingsDialog(self).exec())
-        e = self.menuBar().addMenu("&Edit")
+        e = self.mbar.addMenu("&Edit")
         self._act(e, "Undo", self.undo, QKeySequence.Undo)
         self._act(e, "Redo", self.redo, QKeySequence.Redo)
         e.addSeparator()
         self._act(e, "Copy", self.copy_layers, QKeySequence.Copy)
         self._act(e, "Paste", self.paste_layers, QKeySequence.Paste)
-        m = self.menuBar().addMenu("&View")
+        m = self.mbar.addMenu("&View")
         a = self._act(m, "Zoom In", lambda: self.zoom(1.2))
         a.setShortcuts([QKeySequence("Ctrl++"), QKeySequence("Ctrl+="), QKeySequence("Ctrl+Shift+=")])
         a = self._act(m, "Zoom Out", lambda: self.zoom(1 / 1.2))
@@ -5424,9 +6629,10 @@ class Main(QMainWindow):
         m.addSeparator()
         self._act(m, "Full Screen Preview (2 slides)", self.preview_fullscreen, "F11")
         self._act(m, "Toggle Guides", self.toggle_guides)
-        m = self.menuBar().addMenu("&Insert")
+        m = self.mbar.addMenu("&Insert")
         self._act(m, "Add Image", self.add_image)
         self._act(m, "Add Video", self.add_video)
+        self._act(m, "Templates...", self.templates)
         m.addSeparator()
         self._act(m, "Rectangle", lambda: self.add_shape("rect"))
         self._act(m, "Ellipse", lambda: self.add_shape("ellipse"))
@@ -5436,7 +6642,7 @@ class Main(QMainWindow):
         self._act(m, "Grid (plain 2 x 2)", self.add_grid_simple)
         self._act(m, "Overlay (tinted layer over all slides)", self.add_overlay)
         self._act(m, "Play / Pause Videos", self.toggle_video)
-        m = self.menuBar().addMenu("&Layer")
+        m = self.mbar.addMenu("&Layer")
         self._act(m, "Duplicate", self.duplicate, "Ctrl+D")
         self._act(m, "Center in Slide", self.center_in_slide)
         self._act(m, "Crop Image...", self.crop_image)
@@ -5457,101 +6663,584 @@ class Main(QMainWindow):
         self._act(m, "Shape Fill Color...", lambda: self.shape_prop("fill"))
         self._act(m, "Shape Border Color...", lambda: self.shape_prop("border"))
         self._act(m, "Shape Border Width...", lambda: self.shape_prop("width"))
-        m = self.menuBar().addMenu("&Image")
-        self._act(m, "Edit Image...", self.edit_image)
+        m = self.mbar.addMenu("&Image")
+        self._act(m, "Edit Image...", self.edit_image, "Ctrl+E")
         self._act(m, "Crop...", self.crop_image)
         self._act(m, "Crop to Frame (keep size)", lambda: self.crop_image(True))
         self._act(m, "Replace Image...", self.replace_image)
         self.fill_fit_menu(m.addMenu("Fit"))
-        m = self.menuBar().addMenu("&Text")
+        m = self.mbar.addMenu("&Text")
         self.fill_text_menu(m)
-        m = self.menuBar().addMenu("&Background Tools")
+        m = self.mbar.addMenu("&Background Tools")
         self.fill_bg_menu(m)
-        m = self.menuBar().addMenu("&Canvas")
+        m = self.mbar.addMenu("&Canvas")
         self._act(m, "Background (solid / gradient / texture)...", self.pick_bg)
         self._act(m, "Custom Slide Size...", self.custom_size)
-        # one-click items right on the main ribbon
-        self.menuBar().addAction("Templates", self.templates)
-        a = self.menuBar().addAction("Edit Image", self.edit_image)
-        a.setShortcut("Ctrl+E")
+
+    def _icon_for(self, target, name, on_accent=False):
+        self.icon_targets.append((target, name, on_accent))
+        self._set_icon(target, name, on_accent)
+
+    def _set_icon(self, target, name, on_accent=False):
+        t = theme_tokens()
+        ic = ui_icon(name, t["accent_text"], t["accent_text"], t["muted"]) if on_accent else ui_icon(name)
+        target.setIcon(ic)
+
+    def refresh_icons(self):
+        for sec in self.findChildren(Section):
+            sec.refresh_chev()
+        for target, name, on_accent in getattr(self, "icon_targets", []):
+            try:
+                self._set_icon(target, name, on_accent)
+            except RuntimeError:
+                pass
+
+    def _tool(self, bar, text, name, fn, tip="", checkable=False, checked=False):
+        a = QAction(text, self)
+        a.setToolTip(tip or text)
+        a.setCheckable(checkable)
+        if checkable:
+            a.setChecked(checked)
+            a.toggled.connect(fn)
+        else:
+            a.triggered.connect(lambda checked=False: fn())
+        self._icon_for(a, name)
+        bar.addAction(a)
+        return a
+
+    def _fbtn(self, name, tip, fn, checkable=False):
+        """Small square icon button for the tool options bar."""
+        b = QToolButton()
+        b.setObjectName("fmt")
+        b.setToolTip(tip)
+        b.setCheckable(checkable)
+        b.setIconSize(QSize(18, 18))
+        self._icon_for(b, name)
+        b.clicked.connect(lambda checked=False: fn())
+        return b
+
+    def _tbtn(self, text, name, tip, fn, menu=None):
+        """Icon + text button for the tool options bar (optionally with a drop-down menu)."""
+        b = QToolButton()
+        b.setObjectName("fmtText")
+        b.setText(text)
+        b.setToolTip(tip)
+        b.setIconSize(QSize(18, 18))
+        b.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self._icon_for(b, name)
+        if menu is not None:
+            b.setMenu(menu)
+            b.setPopupMode(QToolButton.InstantPopup)
+        else:
+            b.clicked.connect(lambda checked=False: fn())
+        return b
 
     def _build_toolbar(self):
-        tb = QToolBar("Main")
-        tb.setMovable(False)
-        self.addToolBar(tb)
-        tb.addAction("Undo", self.undo)
-        tb.addAction("Redo", self.redo)
-        tb.addSeparator()
-        tb.addAction("Add Image", self.add_image)
-        tb.addAction("Add Video", self.add_video)
-        tb.addAction("Add Text", self.add_text)
-        tb.addAction("Crop", self.crop_image)
-        tb.addAction("Replace Image", self.replace_image)
-        tb.addAction("Grids", self.add_grid)
-        tb.addAction("Full Screen", self.preview_fullscreen)
-        tb.addSeparator()
-        tb.addAction("Send to Front", lambda: self.arrange("forward"))
-        tb.addAction("Send to Back", lambda: self.arrange("backward"))
-        tb.addAction("Delete", self.delete_selected)
-        tb.addSeparator()
-        tb.addWidget(QLabel(" Panels: "))
-        self.n_spin = QSpinBox()
-        self.n_spin.setRange(1, 20)
-        self.n_spin.valueChanged.connect(self.set_panels)
-        tb.addWidget(self.n_spin)
-        tb.addWidget(QLabel(" Rows: "))
-        self.rows_spin = QSpinBox()
-        self.rows_spin.setRange(1, 20)
-        self.rows_spin.valueChanged.connect(self.set_rows)
-        tb.addWidget(self.rows_spin)
+        self.icon_targets = []
+        self.ctx_sync = False
+        # ---- left tool rail: everything you add or change a layer with
+        rail = QToolBar("Tools")
+        rail.setObjectName("tools")
+        rail.setMovable(False)
+        rail.setFloatable(False)
+        rail.setOrientation(Qt.Vertical)
+        rail.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+        rail.setIconSize(QSize(22, 22))
+        self.addToolBar(Qt.LeftToolBarArea, rail)
+        self.rail = rail
+        self._tool(rail, "Image", "image", self.add_image, "Add images")
+        self._tool(rail, "Video", "video", self.add_video, "Add a video")
+        self._tool(rail, "Text", "text", self.add_text, "Add text")
+        shapes = QAction("Shapes", self)
+        shapes.setToolTip("Rectangle, ellipse, line, overlay")
+        sm = QMenu(self)
+        for label, fn in (("Rectangle", lambda: self.add_shape("rect")), ("Ellipse", lambda: self.add_shape("ellipse")),
+                          ("Line", lambda: self.add_shape("line")), ("Overlay (tinted layer)", self.add_overlay)):
+            sm.addAction(label, fn)
+        shapes.setMenu(sm)
+        self._icon_for(shapes, "shape")
+        rail.addAction(shapes)
+        rail.widgetForAction(shapes).setPopupMode(QToolButton.InstantPopup)
+        self._tool(rail, "Grids", "grid", self.add_grid, "Photo grid layouts")
+        self._tool(rail, "Templates", "template", self.templates, "Ready-made carousel templates")
+        rail.addSeparator()
+        self._tool(rail, "Canvas", "canvas", self.pick_bg, "Slide background: colour, gradient, texture")
+        sp = QWidget()
+        sp.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        rail.addWidget(sp)
+
+        # ---- top app bar: home, menus | project name | undo, redo, zoom, preview, export
+        top = QWidget()
+        top.setObjectName("topbar")
+        tl = QHBoxLayout(top)
+        tl.setContentsMargins(14, 10, 14, 4)
+        tl.setSpacing(8)
+        left = QWidget()
+        ll = QHBoxLayout(left)
+        ll.setContentsMargins(0, 0, 0, 0)
+        ll.setSpacing(6)
+        home = QToolButton()
+        home.setObjectName("homeBtn")
+        home.setToolTip("Home - back to the start screen")
+        home.setIconSize(QSize(32, 32))
+        logo = resource_path("assets", "aero_icon_256.png")
+        if os.path.exists(logo):
+            home.setIcon(QIcon(QPixmap(logo)))
+        home.clicked.connect(lambda checked=False: self.close_project())
+        ll.addWidget(home)
+        self.mbar.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+        ll.addWidget(self.mbar)
+        ll.addStretch()
+        center = QWidget()
+        cl = QHBoxLayout(center)
+        cl.setContentsMargins(0, 0, 0, 0)
+        cl.setSpacing(8)
+        self.proj_title = QLabel("Untitled")
+        self.proj_title.setObjectName("projTitle")
+        self.proj_state = QLabel("Saved")
+        self.proj_state.setObjectName("chipSaved")
+        cl.addWidget(self.proj_title)
+        cl.addWidget(self.proj_state)
+        right = QWidget()
+        rl = QHBoxLayout(right)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.setSpacing(4)
+        rl.addStretch()
+        for name, fn, tip in (("undo", self.undo, "Undo (Ctrl+Z)"), ("redo", self.redo, "Redo (Ctrl+Y)")):
+            b = QToolButton()
+            b.setToolTip(tip)
+            b.setIconSize(QSize(20, 20))
+            b.clicked.connect(lambda checked=False, f=fn: f())
+            self._icon_for(b, name)
+            rl.addWidget(b)
+        pv = QPushButton(" Preview")
+        pv.setObjectName("ghost")
+        pv.setToolTip("Full screen preview of two slides (F11)")
+        pv.clicked.connect(lambda: self.preview_fullscreen())
+        self._icon_for(pv, "play")
+        rl.addWidget(pv)
+        ex = QPushButton(" Export")
+        ex.setObjectName("primary")
+        ex.setToolTip("Save every slide as image / video files")
+        ex.clicked.connect(lambda: self.export())
+        self._icon_for(ex, "export", True)
+        rl.addWidget(ex)
+        lw, rw = left.sizeHint().width(), right.sizeHint().width()
+        left.setMinimumWidth(lw)
+        right.setMinimumWidth(rw)
+        left.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        right.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        tl.addWidget(left, 1)
+        tl.addWidget(center, 0)
+        tl.addWidget(right, 1)
+        self.setMenuWidget(top)
+        self.topbar = top
+
+        # ---- tool options bar: shows what you can do with the selected layer (font, size, alignment, crop, fill ...)
+        bar = QToolBar("Options")
+        bar.setObjectName("opts")
+        bar.setMovable(False)
+        bar.setFloatable(False)
+        bar.setIconSize(QSize(20, 20))
+        self.addToolBar(Qt.TopToolBarArea, bar)
+        self.opts = bar
+        self.ctx = QStackedWidget()
+        self.ctx.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+
+        def page(*widgets):
+            w = QWidget()
+            h = QHBoxLayout(w)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setSpacing(4)
+            for x in widgets:
+                if x == "|":
+                    ln = QFrame()
+                    ln.setObjectName("vline")
+                    ln.setFixedHeight(20)
+                    h.addSpacing(4)
+                    h.addWidget(ln)
+                    h.addSpacing(4)
+                else:
+                    h.addWidget(x)
+            h.addStretch()
+            return w
+        hint = QLabel("Nothing selected  -  click a photo, text or shape on the canvas to see its tools here")
+        hint.setObjectName("ctxHint")
+        self.ctx.addWidget(page(hint))
+        # text
+        self.c_font = QFontComboBox()
+        self.c_font.setMinimumWidth(190)
+        self.c_font.setMaxVisibleItems(14)
+        self.c_font.setToolTip("Font")
+        self.c_font.currentFontChanged.connect(lambda f: self.ctx_font_family(f.family()))
+        self.c_size = QSpinBox()
+        self.c_size.setRange(4, 600)
+        self.c_size.setSuffix(" pt")
+        self.c_size.setKeyboardTracking(False)
+        self.c_size.setFixedWidth(84)
+        self.c_size.setToolTip("Font size")
+        self.c_size.valueChanged.connect(self.ctx_font_size)
+        self.c_b = self._fbtn("bold", "Bold", lambda: self.text_style("b"), True)
+        self.c_i = self._fbtn("italic", "Italic", lambda: self.text_style("i"), True)
+        self.c_u = self._fbtn("underline", "Underline", lambda: self.text_style("u"), True)
+        self.c_col = QToolButton()
+        self.c_col.setObjectName("fmt")
+        self.c_col.setToolTip("Text colour")
+        self.c_col.clicked.connect(lambda checked=False: self.pick_text_color())
+        self.c_al = {}
+        grp = QButtonGroup(self)
+        grp.setExclusive(True)
+        for key, name, tip in (("left", "alignl", "Align left"), ("center", "alignc", "Align centre"),
+                               ("right", "alignr", "Align right"), ("justify", "alignj", "Justify")):
+            b = self._fbtn(name, tip, lambda k=key: self.text_align(k), True)
+            grp.addButton(b)
+            self.c_al[key] = b
+        tm = QMenu(self)
+        self.fill_text_menu(tm)
+        self.ctx.addWidget(page(self.c_font, self.c_size, "|", self.c_b, self.c_i, self.c_u, self.c_col, "|",
+                                *self.c_al.values(), "|", self._tbtn("More", "more", "Line spacing, indent, outline, text box", None, tm)))
+        # photo / video / grid
+        fm = QMenu(self)
+        self.fill_fit_menu(fm)
+        bm = QMenu(self)
+        self.fill_bg_menu(bm)
+        self.c_crop = self._tbtn("Crop", "crop", "Crop the selected photo or video", self.crop_image)
+        self.c_replace = self._tbtn("Replace", "replace", "Replace the photo, keeping its size", self.replace_image)
+        self.c_filters = self._tbtn("Filters", "adjust", "Filters and adjustments (Ctrl+E)", self.edit_image)
+        self.c_fit = self._tbtn("Fit", "fit", "Fill height / width / 2 slides", None, fm)
+        self.c_bgtools = self._tbtn("Background", "layers", "Remove background, cut out, erase", None, bm)
+        self.c_trim = self._tbtn("Trim", "video", "Trim video length", self.trim_video)
+        self.c_snd_on = self._tbtn("Sound on", "volume", "This video's sound is in the export. Click to mute it", lambda: self.set_mute(True))
+        self.c_snd_off = self._tbtn("Muted", "mute", "This video is muted in the export. Click to turn its sound on", lambda: self.set_mute(False))
+        self.c_fill = self._tbtn("Fill cells", "grid", "Fill the grid cells with photos", self.fill_grid)
+        self.c_gset = self._tbtn("Grid settings", "settings", "Rows, columns, gap, corners", self.grid_settings)
+        self.c_flipx = self._fbtn("fliph", "Flip horizontally", lambda: self.flip("h"))
+        self.c_flipy = self._fbtn("flipv", "Flip vertically", lambda: self.flip("v"))
+        self.ctx.addWidget(page(self.c_crop, self.c_replace, self.c_filters, self.c_fit, self.c_bgtools, self.c_trim, self.c_snd_on, self.c_snd_off, self.c_fill,
+                                self.c_gset, "|", self.c_flipx, self.c_flipy))
+        # shape
+        self.c_sfill = self._tbtn("Fill", "shape", "Fill colour", lambda: self.shape_prop("fill"))
+        self.c_sborder = self._tbtn("Border", "shape", "Border colour", lambda: self.shape_prop("border"))
+        self.c_sedit = self._tbtn("Edit shape", "settings", "Opacity, corners, shadow, border style", self.shape_panel)
+        self.ctx.addWidget(page(self.c_sfill, self.c_sborder, self.c_sedit))
+        bar.addWidget(self.ctx)
+        sp2 = QWidget()
+        sp2.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        bar.addWidget(sp2)
+        self._tool(bar, "Guides", "guides", lambda on: (setattr(self.scene, "show_guides", on), self.scene.update()),
+                   "Show or hide the slide cut guides", True, self.scene.show_guides)
+        self._tool(bar, "Snap", "snap", lambda v: setattr(self.scene, "snap_enabled", v), "Snap to slides, layers and angles", True, True)
+        # ---- status bar
+        sb = self.statusBar()
+        sb.setSizeGripEnabled(False)
+        self.st_info = QLabel("")
+        sb.addWidget(self.st_info, 1)
+        self.st_gpu = QLabel("")
+        sb.addPermanentWidget(self.st_gpu)
+        self.zoom_timer = QTimer(self)
+        self.zoom_timer.timeout.connect(self.update_zoom_label)
+        self.zoom_timer.start(250)
+
+    def _build_float_bar(self):
+        """Floating bar at the bottom of the canvas: go to a slide, zoom, fit."""
+        bar = QFrame(self.view.viewport())
+        bar.setObjectName("floatBar")
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(6, 4, 6, 4)
+        lay.setSpacing(2)
+
+        def btn(name, tip, fn):
+            b = QToolButton()
+            b.setToolTip(tip)
+            b.setIconSize(QSize(18, 18))
+            b.clicked.connect(lambda checked=False: fn())
+            self._icon_for(b, name)
+            return b
+
+        def vline():
+            ln = QFrame()
+            ln.setObjectName("vline")
+            ln.setFixedSize(1, 18)
+            return ln
+        self.st_slide = QLabel("Slide 1 of 1")
+        self.st_slide.setMinimumWidth(86)
+        self.st_slide.setAlignment(Qt.AlignCenter)
+        self.st_zoom = QToolButton()
+        self.st_zoom.setToolTip("Click to fit the whole project in the window (Ctrl+0)")
+        self.st_zoom.setMinimumWidth(52)
+        self.st_zoom.clicked.connect(lambda: self.fit())
+        for w in (btn("chevl", "Previous slide", lambda: self.goto_slide(-1)), self.st_slide,
+                  btn("chevr", "Next slide", lambda: self.goto_slide(1)), vline(),
+                  btn("minus", "Zoom out (Ctrl+-)", lambda: self.zoom(1 / 1.2)), self.st_zoom,
+                  btn("plus", "Zoom in (Ctrl++)", lambda: self.zoom(1.2)), vline(),
+                  btn("fit", "Fit the whole project (Ctrl+0)", self.fit)):
+            lay.addWidget(w)
+        sh = QGraphicsDropShadowEffect(bar)
+        sh.setBlurRadius(28)
+        sh.setOffset(0, 6)
+        sh.setColor(QColor(0, 0, 0, 90))
+        bar.setGraphicsEffect(sh)
+        self.fbar = bar
+        bar.adjustSize()
+        self.view.on_resize = self.place_float_bar
+        self.place_float_bar()
+
+    def place_float_bar(self):
+        vp = self.view.viewport()
+        self.fbar.adjustSize()
+        self.fbar.move((vp.width() - self.fbar.width()) // 2, vp.height() - self.fbar.height() - 18)
+        self.fbar.raise_()
+
+    def cur_slide(self):
+        sc = self.scene
+        c = self.view.mapToScene(self.view.viewport().rect().center())
+        col = min(max(int(c.x() // sc.pw), 0), sc.n - 1)
+        row = min(max(int(c.y() // sc.ph), 0), sc.rows - 1)
+        return row * sc.n + col
+
+    def goto_slide(self, d):
+        sc = self.scene
+        k = min(max(self.cur_slide() + d, 0), sc.n * sc.rows - 1)
+        self.view.centerOn(slide_rect(sc, k).center())
+
+    # ---- tool options: text
+    def _text_items(self):
+        return [i for i in self.layers_sel() if isinstance(i, TextItem) and not i.data(1)]
+
+    def ctx_font_family(self, fam):
+        if self.ctx_sync:
+            return
+        its = self._text_items()
+        for it in its:
+            f = it.font()
+            f.setFamily(fam)
+            it.setFont(f)
+            self.relayout(it)
+        if its:
+            self.commit()
+
+    def ctx_font_size(self, v):
+        if self.ctx_sync:
+            return
+        its = self._text_items()
+        for it in its:
+            f = it.font()
+            f.setPointSize(int(v))
+            it.setFont(f)
+            self.relayout(it)
+        if its:
+            self.commit()
+
+    def update_context(self):
+        """Show the tools that fit the selected layer and fill them with its current values."""
+        if not hasattr(self, "ctx"):
+            return
+        try:
+            it = self.selected()
+        except RuntimeError:
+            return
+        self.ctx_sync = True
+        try:
+            if it is None or not isinstance(it, LAYERS):
+                idx = 0
+            elif isinstance(it, TextItem):
+                idx = 1
+                f = it.font()
+                self.c_font.setCurrentFont(f)
+                self.c_size.setValue(f.pointSize() if f.pointSize() > 0 else 12)
+                self.c_b.setChecked(f.bold())
+                self.c_i.setChecked(f.italic())
+                self.c_u.setChecked(f.underline())
+                set_swatch(self.c_col, it.defaultTextColor().name(QColor.HexArgb))
+                (self.c_al.get(it.align) or self.c_al["left"]).setChecked(True)
+            elif isinstance(it, ShapeItem):
+                idx = 3
+                set_swatch(self.c_sfill, "#00000000" if it.no_fill else it.fill.name(QColor.HexArgb))
+                set_swatch(self.c_sborder, "#00000000" if it.no_border else it.border.name(QColor.HexArgb))
+            else:
+                idx = 2
+                is_vid = HAS_VIDEO and isinstance(it, VideoItem)
+                is_grid = isinstance(it, GridItem)
+                is_pic = isinstance(it, QGraphicsPixmapItem)
+                for w, on in ((self.c_crop, is_pic or is_vid), (self.c_replace, is_pic), (self.c_filters, True), (self.c_fit, is_pic),
+                              (self.c_bgtools, is_pic), (self.c_trim, is_vid), (self.c_snd_on, is_vid and not it.muted),
+                              (self.c_snd_off, is_vid and it.muted), (self.c_fill, is_grid), (self.c_gset, is_grid),
+                              (self.c_flipx, True), (self.c_flipy, True)):
+                    w.setVisible(on)
+            self.ctx.setCurrentIndex(idx)
+            kind = "" if it is None or not isinstance(it, LAYERS) else self.layer_kind(it).split("  ")[0]
+            self.prop_kind.setText(kind if kind else "Canvas")
+        finally:
+            self.ctx_sync = False
+
+    def update_zoom_label(self):
+        try:
+            self.st_zoom.setText(f"{int(round(self.view.transform().m11() * 100))}%")
+            self.st_slide.setText(f"Slide {self.cur_slide() + 1} of {self.scene.n * self.scene.rows}")
+        except RuntimeError:
+            self.zoom_timer.stop()
+
+    def update_status(self):
+        if not hasattr(self, "st_info"):
+            return
+        sc = self.scene
+        total = sc.n * sc.rows
+        self.st_info.setText(f"{sc.pw} \u00d7 {sc.ph} px   \u00b7   {total} slide{'s' if total != 1 else ''}"
+                             f"   \u00b7   {len(self.content_items())} layer{'s' if len(self.content_items()) != 1 else ''}")
+        self.st_gpu.setText("\u25cf GPU drawing" if getattr(self, "gpu_active", False) else "\u25cb Software drawing")
+
+    def _dock_head(self, title, count=False):
+        w = QWidget()
+        w.setObjectName("dockHead")
+        h = QHBoxLayout(w)
+        h.setContentsMargins(10, 0, 12, 0)
+        t = QLabel(title)
+        t.setObjectName("dockTitle")
+        h.addWidget(t)
+        h.addStretch()
+        c = None
+        if count:
+            c = QLabel("")
+            c.setObjectName("dockCount")
+            h.addWidget(c)
+        return w, c
+
+    def _build_side_panel(self):
+        body = QWidget()
+        body.setObjectName("panelBody")
+        outer = QVBoxLayout(body)
+        outer.setContentsMargins(4, 4, 4, 4)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        outer.addWidget(scroll)
+        inner = QWidget()
+        inner.setObjectName("plainBody")
+        inner.setStyleSheet("QWidget#plainBody { background: transparent; }")
+        scroll.setWidget(inner)
+        lay = QVBoxLayout(inner)
+        lay.setContentsMargins(14, 4, 14, 12)
+        lay.setSpacing(0)
+        # ---- Canvas: size, number of slides, background (always available)
+        sec = Section("Canvas", True)
+        self.sec_canvas = sec
+        lab = QLabel("Slide size")
+        lab.setObjectName("fieldLab")
+        sec.bl.addWidget(lab)
         self.preset = QComboBox()
         self.preset.addItems(PRESETS)
         self.preset.currentTextChanged.connect(self.set_preset)
-        tb.addWidget(self.preset)
-        tb.addAction("Toggle Guides", self.toggle_guides)
-        snap = tb.addAction("Snap")
-        snap.setCheckable(True)
-        snap.setChecked(True)
-        snap.toggled.connect(lambda v: setattr(self.scene, "snap_enabled", v))
-        tb.addSeparator()
-        tb.addAction("Export", self.export)
-
-    def _build_side_panel(self):
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        self.s_scale = self._slider(lay, "Scale (%)", 2, 1000, self.apply_scale)
-        self.s_rot = self._slider(lay, "Rotation (deg)", -180, 180, self.apply_rot)
-        self.s_op = self._slider(lay, "Opacity (%)", 5, 100, self.apply_opacity)
+        sec.bl.addWidget(self.preset)
+        g = QGridLayout()
+        g.setHorizontalSpacing(10)
+        g.setVerticalSpacing(2)
+        self.n_spin, self.rows_spin = QSpinBox(), QSpinBox()
+        for k, (lb, sp_, fn) in enumerate((("Slides across", self.n_spin, self.set_panels), ("Rows", self.rows_spin, self.set_rows))):
+            sp_.setRange(1, 20)
+            sp_.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+            sp_.valueChanged.connect(fn)
+            l_ = QLabel(lb)
+            l_.setObjectName("fieldLab")
+            g.addWidget(l_, 0, k)
+            g.addWidget(sp_, 1, k)
+        sec.bl.addLayout(g)
+        bgb = QPushButton("  Background...")
+        bgb.setToolTip("Solid colour, gradient or texture behind all slides")
+        bgb.clicked.connect(lambda: self.pick_bg())
+        self._icon_for(bgb, "canvas")
+        sec.bl.addWidget(bgb)
+        lay.addWidget(sec)
+        # ---- selection
+        self.prop_hint = QLabel("Select a photo, text, shape or video on the canvas to change its position, size and look. With nothing selected you change the slides here.")
+        self.prop_hint.setObjectName("hint")
+        self.prop_hint.setWordWrap(True)
+        self.prop_hint.setContentsMargins(0, 12, 0, 0)
+        lay.addWidget(self.prop_hint)
+        self.prop_body = QWidget()
+        self.prop_body.setObjectName("plainBody")
+        self.prop_body.setStyleSheet("QWidget#plainBody { background: transparent; }")
+        pl = QVBoxLayout(self.prop_body)
+        pl.setContentsMargins(0, 0, 0, 0)
+        pl.setSpacing(0)
+        st = Section("Transform", True)
         grid = QGridLayout()
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(2)
         self.pos_boxes = {}
-        for i, (k, label, lo, hi) in enumerate((("x", "X (px)", -30000, 60000), ("y", "Y (px)", -30000, 60000),
-                                                 ("w", "Width", 1, 30000), ("h", "Height", 1, 30000),
-                                                 ("r", "Rotation", -180, 180))):
+        for i, (k, label, lo, hi, suf) in enumerate((("x", "X", -30000, 60000, " px"), ("y", "Y", -30000, 60000, " px"),
+                                                      ("w", "Width", 1, 30000, " px"), ("h", "Height", 1, 30000, " px"),
+                                                      ("r", "Rotation", -180, 180, "\u00b0"))):
             sb = QSpinBox()
             sb.setRange(lo, hi)
+            sb.setSuffix(suf)
             sb.setKeyboardTracking(False)
+            sb.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+            sb.setMinimumWidth(60)
             sb.valueChanged.connect(lambda v, k=k: self.apply_pos(k, v))
             self.pos_boxes[k] = sb
-            grid.addWidget(QLabel(label), (i // 2) * 2, i % 2)
+            lb = QLabel(label)
+            lb.setObjectName("fieldLab")
+            grid.addWidget(lb, (i // 2) * 2, i % 2)
             grid.addWidget(sb, (i // 2) * 2 + 1, i % 2)
-        lay.addLayout(grid)
-        lay.addWidget(QLabel("Width/Height keep the aspect ratio (always locked)."))
+        st.bl.addLayout(grid)
+        note = QLabel("Width and height keep the aspect ratio.")
+        note.setObjectName("hint")
+        st.bl.addWidget(note)
+        pl.addWidget(st)
+        sa = Section("Appearance", True)
+        self.slider_vals = {}
+        self.s_scale = self._slider(sa.bl, "Scale", 2, 1000, self.apply_scale, "%")
+        self.s_rot = self._slider(sa.bl, "Rotation", -180, 180, self.apply_rot, "\u00b0")
+        self.s_op = self._slider(sa.bl, "Opacity", 5, 100, self.apply_opacity, "%")
+        pl.addWidget(sa)
+        lay.addWidget(self.prop_body)
+        # ---- help
+        sh = Section("Tips && shortcuts", False)
+        tips = QLabel("Mouse wheel = zoom\nMiddle mouse drag = move the workspace\nDouble-click text to edit it\n"
+                      "Drag corner squares to resize, the round handle to rotate (Shift = 15\u00b0 steps)\n"
+                      "Moving and resizing snap to slides, layers and angles (hold Alt to bypass)\n"
+                      "Right-click a layer for lock, duplicate, delete...\nF11 = full screen preview (Esc leaves)\n"
+                      "Del = delete    Ctrl+Z / Ctrl+Y = undo / redo    Ctrl+S = save\nPink dashed lines = slide cuts")
+        tips.setObjectName("hint")
+        tips.setWordWrap(True)
+        sh.bl.addWidget(tips)
+        lay.addWidget(sh)
         lay.addStretch()
-        lay.addWidget(QLabel("Tips:\n- Mouse wheel = zoom view\n- Double-click text to edit\n"
-                             "- Drag corner squares to resize\n- Drag round handle to rotate (Shift = 15 deg steps)\n- Moving, resizing and rotating snap to slides, other layers and 45-degree angles (hold Alt to bypass)\n- Right-click a layer: lock, duplicate, delete...\n- F11 = full screen preview (Esc leaves)\n- Del removes selection\n- Ctrl+Z / Ctrl+Y undo / redo\n"
-                             "- Ctrl+S saves the project\n- Pink dashed lines = slide cuts"))
-        self.side_dock = dock = QDockWidget("Selected layer", self)
-        dock.setWidget(w)
+        self.side_dock = dock = QDockWidget("Properties", self)
+        head, self.prop_kind = self._dock_head("Properties", True)
+        dock.setTitleBarWidget(head)
+        dock.setFeatures(QDockWidget.NoDockWidgetFeatures)
+        dock.setWidget(body)
+        body.setMinimumWidth(310)
         self.addDockWidget(Qt.RightDockWidgetArea, dock)
 
-    def _slider(self, lay, label, lo, hi, fn):
-        lay.addWidget(QLabel(label))
+    def _slider(self, lay, label, lo, hi, fn, unit=""):
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+        lb = QLabel(label)
+        lb.setObjectName("fieldLab")
+        lb.setFixedWidth(58)
+        val = QLabel("")
+        val.setObjectName("val")
+        val.setFixedWidth(48)
+        val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         s = QSlider(Qt.Horizontal)
         s.setRange(lo, hi)
         s.valueChanged.connect(fn)
+        s.valueChanged.connect(lambda v, s=s: self.show_slider_value(s))
         s.sliderReleased.connect(self.commit)
-        lay.addWidget(s)
+        row.addWidget(lb)
+        row.addWidget(s, 1)
+        row.addWidget(val)
+        lay.addLayout(row)
+        self.slider_vals[s] = (val, unit)
         return s
+
+    def show_slider_value(self, s):
+        val, unit = self.slider_vals[s]
+        val.setText(f"{s.value()}{unit}")
 
     # ---------- state snapshot / history ----------
     def content_items(self):
@@ -5560,7 +7249,7 @@ class Main(QMainWindow):
     def item_dict(self, it, z):
         d = {"x": round(it.x(), 2), "y": round(it.y(), 2), "scale": round(it.scale(), 4),
              "rot": round(it.rotation(), 2), "op": round(it.opacity(), 2), "z": z,
-             "locked": bool(it.data(1)), "fx": bool(it.data(2)), "fy": bool(it.data(3))}
+             "locked": bool(it.data(1)), "fx": bool(it.data(2)), "fy": bool(it.data(3)), "hidden": bool(it.data(8))}
         if isinstance(it, TextItem):
             d.update(type="text", text=it.toPlainText(), font=it.font().toString(),
                      color=it.defaultTextColor().name(QColor.HexArgb), align=it.align, box_w=it.box_w,
@@ -5577,7 +7266,7 @@ class Main(QMainWindow):
                      bpos=it.bpos, bjoin=it.bjoin, nofill=it.no_fill, noborder=it.no_border)
         elif HAS_VIDEO and isinstance(it, VideoItem):
             d.update(type="video", path=it.path, w=round(it.size().width(), 1), h=round(it.size().height(), 1),
-                     crop=it.crop, adj=it.adj(), trim=list(it.trim) if it.trim else None)
+                     crop=it.crop, adj=it.adj(), trim=list(it.trim) if it.trim else None, muted=it.muted)
         else:
             d.update(type="image", id=it.data(0), adj=json.loads(it.data(5) or "{}"), crop=json.loads(it.data(6) or "null"),
                      mask=it.data(7))
@@ -5625,7 +7314,7 @@ class Main(QMainWindow):
         elif t == "video":
             if not HAS_VIDEO:
                 return
-            it = VideoItem(d["path"], QSizeF(d["w"], d["h"]), crop=d.get("crop"), adj=d.get("adj"), trim=d.get("trim"))
+            it = VideoItem(d["path"], QSizeF(d["w"], d["h"]), crop=d.get("crop"), adj=d.get("adj"), trim=d.get("trim"), muted=d.get("muted", False))
         else:
             pm = self.pixmaps.get(d["id"])
             if pm is None:
@@ -5646,6 +7335,9 @@ class Main(QMainWindow):
         it.setOpacity(d["op"])
         it.setZValue(d["z"])
         self.set_locked(it, d.get("locked", False))
+        if d.get("hidden"):
+            it.setData(8, True)
+            it.setVisible(False)
         it.setData(2, d.get("fx", False))
         it.setData(3, d.get("fy", False))
         apply_flip(it)
@@ -5733,6 +7425,15 @@ class Main(QMainWindow):
     def update_title(self):
         name = Path(self.path).name if self.path else "Untitled"
         self.setWindowTitle(f"{name}{'*' if self.dirty() else ''} - Aero")
+        if hasattr(self, "proj_title"):
+            self.proj_title.setText(Path(self.path).stem if self.path else "Untitled project")
+            dirty = self.dirty()
+            self.proj_state.setText(("Unsaved changes" if self.path else "Not saved yet") if dirty else "Saved")
+            self.proj_state.setObjectName("chipDirty" if dirty else "chipSaved")
+            self.proj_state.style().unpolish(self.proj_state)
+            self.proj_state.style().polish(self.proj_state)
+        self.update_context()
+        self.update_status()
         if hasattr(self, "layer_list") and not self.syncing:
             self.refresh_layers()
 
@@ -6358,38 +8059,161 @@ class Main(QMainWindow):
         self.layer_list = QListWidget()
         self.layer_list.setDragDropMode(QAbstractItemView.InternalMove)
         self.layer_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.layer_list.setIconSize(QSize(44, 44))
         self.layer_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.layer_list.customContextMenuRequested.connect(self.layer_menu)
         self.layer_list.itemSelectionChanged.connect(self.list_select)
         self.layer_list.model().rowsMoved.connect(lambda *a: QTimer.singleShot(0, self.list_reordered))
-        dock = QDockWidget("Layers (drag to reorder, right-click for options)", self)
-        dock.setWidget(self.layer_list)
+        self.layer_list.setObjectName("layers")
+        self.layer_list.setIconSize(QSize(40, 40))
+        self.layer_list.setSpacing(0)
+        self.layer_list.setMouseTracking(True)
+        self.layer_list.setItemDelegate(LayerDelegate(self.layer_list))
+        self.layer_clicks = LayerClicks(self.layer_list, self.toggle_hidden_k, self.toggle_lock_k)
+        body = QWidget()
+        body.setObjectName("panelBody")
+        bl = QVBoxLayout(body)
+        bl.setContentsMargins(8, 8, 8, 8)
+        bl.setSpacing(6)
+        self.layer_search = QLineEdit()
+        self.layer_search.setObjectName("search")
+        self.layer_search.setPlaceholderText("Search layers")
+        self.layer_search.setClearButtonEnabled(True)
+        self.layer_search.textChanged.connect(lambda *_: self.refresh_layers())
+        sic = QLabel(self.layer_search)
+        sic.setPixmap(icon_pixmap("search", theme_tokens()["muted"], 16))
+        sic.move(10, 8)
+        sic.setAttribute(Qt.WA_TransparentForMouseEvents)
+        bl.addWidget(self.layer_search)
+        chips = QHBoxLayout()
+        chips.setSpacing(4)
+        self.layer_filter = "all"
+        self.chip_group = QButtonGroup(self)
+        self.chip_group.setExclusive(True)
+        for key, label in (("all", "All"), ("photo", "Photos"), ("video", "Video"), ("text", "Text"), ("shape", "Shapes")):
+            c = QToolButton()
+            c.setObjectName("chip")
+            c.setText(label)
+            c.setCheckable(True)
+            c.setChecked(key == "all")
+            c.clicked.connect(lambda checked=False, k=key: self.set_layer_filter(k))
+            self.chip_group.addButton(c)
+            chips.addWidget(c)
+        chips.addStretch()
+        bl.addLayout(chips)
+        bl.addWidget(self.layer_list, 1)
+        foot = QFrame()
+        foot.setObjectName("layerFoot")
+        fl = QHBoxLayout(foot)
+        fl.setContentsMargins(0, 6, 0, 0)
+        fl.setSpacing(2)
+        for name, tip, fn in (("front", "Bring to front", lambda: self.arrange("forward")), ("back", "Send to back", lambda: self.arrange("backward")),
+                              ("duplicate", "Duplicate (Ctrl+D)", self.duplicate)):
+            b = QToolButton()
+            b.setToolTip(tip)
+            b.setIconSize(QSize(18, 18))
+            b.clicked.connect(lambda checked=False, f=fn: f())
+            self._icon_for(b, name)
+            fl.addWidget(b)
+        fl.addStretch()
+        b = QToolButton()
+        b.setToolTip("Delete (Del)")
+        b.setIconSize(QSize(18, 18))
+        b.clicked.connect(lambda checked=False: self.delete_selected())
+        self._icon_for(b, "trash")
+        fl.addWidget(b)
+        bl.addWidget(foot)
+        body.setMinimumWidth(310)
+        self.layers_dock = dock = QDockWidget("Layers", self)
+        head, self.layer_count = self._dock_head("Layers", True)
+        dock.setTitleBarWidget(head)
+        dock.setFeatures(QDockWidget.NoDockWidgetFeatures)
+        dock.setWidget(body)
         self.addDockWidget(Qt.RightDockWidgetArea, dock)
+
+    def set_layer_filter(self, key):
+        self.layer_filter = key
+        self.refresh_layers()
+
+    def layer_matches(self, it):
+        f = getattr(self, "layer_filter", "all")
+        if f == "all":
+            return True
+        if f == "text":
+            return isinstance(it, TextItem)
+        if f == "shape":
+            return isinstance(it, ShapeItem)
+        if f == "video":
+            return HAS_VIDEO and isinstance(it, VideoItem)
+        return not isinstance(it, (TextItem, ShapeItem)) and not (HAS_VIDEO and isinstance(it, VideoItem))
 
     def layer_label(self, it):
         if isinstance(it, TextItem):
-            name = "T  " + (it.toPlainText().strip().replace("\n", " ")[:28] or "Text")
-        elif isinstance(it, ShapeItem):
-            name = {"rect": "Rectangle", "ellipse": "Ellipse", "line": "Line"}[it.kind]
-        elif isinstance(it, GridItem):
-            name = f"Grid ({it.count()} cells)" if it.cells else f"Grid {it.rows}x{it.cols}"
-        elif HAS_VIDEO and isinstance(it, VideoItem):
-            name = "Video  " + Path(it.path).name
-        else:
-            name = "Image"
-        return ("\U0001F512 " if it.data(1) else "") + name
+            return it.toPlainText().strip().replace("\n", " ")[:32] or "Text"
+        if isinstance(it, ShapeItem):
+            return {"rect": "Rectangle", "ellipse": "Ellipse", "line": "Line"}[it.kind]
+        if isinstance(it, GridItem):
+            return f"Grid ({it.count()} cells)" if it.cells else f"Grid {it.rows}x{it.cols}"
+        if HAS_VIDEO and isinstance(it, VideoItem):
+            return Path(it.path).name
+        return "Image"
+
+    def layer_kind(self, it):
+        kind = ("Text" if isinstance(it, TextItem) else "Shape" if isinstance(it, ShapeItem) else "Grid" if isinstance(it, GridItem)
+                else "Video" if (HAS_VIDEO and isinstance(it, VideoItem)) else "Image")
+        try:
+            br, k = it.boundingRect(), it.scale()
+            extra = "  \u00b7  Muted" if (HAS_VIDEO and isinstance(it, VideoItem) and it.muted) else ""
+            return f"{kind}  \u00b7  {int(br.width() * k)} \u00d7 {int(br.height() * k)} px{extra}"
+        except RuntimeError:
+            return kind
 
     def refresh_layers(self):
         self.syncing = True
         self.layer_list.clear()
         self.layer_refs = sorted(self.content_items(), key=lambda i: -i.zValue())
+        q = self.layer_search.text().strip().lower() if hasattr(self, "layer_search") else ""
+        filt = getattr(self, "layer_filter", "all") != "all"
+        self.layer_list.setDragDropMode(QAbstractItemView.NoDragDrop if (q or filt) else QAbstractItemView.InternalMove)
         for k, it in enumerate(self.layer_refs):
-            li = QListWidgetItem(QIcon(self.layer_icon(it)), self.layer_label(it))
+            name = self.layer_label(it)
+            if q and q not in name.lower() and q not in self.layer_kind(it).lower():
+                continue
+            if not self.layer_matches(it):
+                continue
+            li = QListWidgetItem(QIcon(self.layer_icon(it)), name)
             li.setData(Qt.UserRole, k)
+            li.setData(Qt.UserRole + 1, self.layer_kind(it))
+            li.setData(Qt.UserRole + 2, bool(it.data(8)))
+            li.setData(Qt.UserRole + 3, bool(it.data(1)))
             self.layer_list.addItem(li)
             li.setSelected(it.isSelected())
+        n = len(self.layer_refs)
+        self.layer_count.setText(f"{n} layer{'s' if n != 1 else ''}")
         self.syncing = False
+
+    def toggle_hidden_k(self, k):
+        if k is None or not (0 <= k < len(self.layer_refs)):
+            return
+        it = self.layer_refs[k]
+        hide = not it.data(8)
+        it.setData(8, hide)
+        it.setVisible(not hide)
+        if hide:
+            it.setSelected(False)
+            if HAS_VIDEO and isinstance(it, VideoItem):
+                it.pause()
+        self.scene.update()
+        self.commit()
+        self.refresh_layers()
+
+    def toggle_lock_k(self, k):
+        if k is None or not (0 <= k < len(self.layer_refs)):
+            return
+        it = self.layer_refs[k]
+        self.set_locked(it, not it.data(1))
+        self.scene.update()
+        self.sync_controls()
+        self.commit()
 
     def layer_icon(self, it, S=88):
         """Small picture of what the layer looks like (cached for photos)."""
@@ -6473,7 +8297,9 @@ class Main(QMainWindow):
             edit += [menu.addAction("Crop Video...", self.crop_image),
                      menu.addAction("Trim Video Length...", self.trim_video),
                      menu.addAction("Edit Video (Filters)...", self.edit_image),
-                     menu.addAction("Play / Pause", self.toggle_video)]
+                     menu.addAction("Play / Pause", self.toggle_video),
+                     menu.addAction("Turn sound on" if hit.muted else "Mute this video", lambda: self.set_mute(not hit.muted)),
+                     menu.addAction("Sound only from this video", self.solo_sound)]
         elif isinstance(hit, TextItem):
             edit.append(menu.addAction("Text Options...", self.text_panel))
             for label, key in (("Align Left", "left"), ("Align Center", "center"), ("Align Right", "right"), ("Justify", "justify")):
@@ -6572,11 +8398,12 @@ class Main(QMainWindow):
     def list_select(self):
         if self.syncing:
             return
-        rows = {self.layer_list.row(i) for i in self.layer_list.selectedItems()}
+        rows = {i.data(Qt.UserRole) for i in self.layer_list.selectedItems()}
         self.syncing = True
         self.scene.clearSelection()
         for r in rows:
-            self.layer_refs[r].setSelected(True)
+            if r is not None and 0 <= r < len(self.layer_refs):
+                self.layer_refs[r].setSelected(True)
         self.syncing = False
 
     def list_reordered(self):
@@ -7008,6 +8835,43 @@ class Main(QMainWindow):
             v.set_trim(d.old)
         v.play()
 
+    def selected_videos(self):
+        return [i for i in self.scene.selectedItems() if HAS_VIDEO and isinstance(i, VideoItem)]
+
+    def set_mute(self, on):
+        """Mute (or unmute) the selected videos: a muted video adds no sound to the exported slide."""
+        vids = self.selected_videos()
+        if not vids:
+            return
+        for v in vids:
+            v.muted = on
+        self.commit()
+        self.refresh_layers()
+        self.sync_controls()
+        self.statusBar().showMessage("Muted: its sound will not be in the exported slide." if on
+                                     else "Sound on: its sound will be in the exported slide.", 4000)
+
+    def solo_sound(self):
+        """Keep the sound of the selected video and mute every other video that shares a slide with it."""
+        vids = self.selected_videos()
+        if not vids:
+            return
+        keep = set(vids)
+        vmap = video_slide_map(self.scene)
+        n = 0
+        for lst in vmap.values():
+            if any(v in keep for v in lst):
+                for v in lst:
+                    if v not in keep and not v.muted:
+                        v.muted = True
+                        n += 1
+        for v in keep:
+            v.muted = False
+        self.commit()
+        self.refresh_layers()
+        self.sync_controls()
+        self.statusBar().showMessage(f"Only the selected video has sound now ({n} other video(s) muted).", 5000)
+
     def toggle_video(self):
         if HAS_VIDEO:
             for it in self.content_items():
@@ -7134,7 +8998,7 @@ class Main(QMainWindow):
         sc = self.scene
         fs = fps_str(fps)
         OW, OH = int(sc.pw * ex) // 2 * 2, int(sc.ph * ex) // 2 * 2
-        auds = {k: [infos[v] for v in vmap[k] if infos[v]["audio"]] for k in vmap}
+        auds = {k: [infos[v] for v in vmap[k] if infos[v]["audio"] and not v.muted] for k in vmap}
         gpu = bool(getattr(limits, "gpu", False))
         level, log = preflight_encoder(FFMPEG, next((a for a in auds.values() if a), []), fs, folder, gpu, (OW, OH))
         if level is None:
@@ -7253,13 +9117,22 @@ class Main(QMainWindow):
             err = str(e)
         finally:
             for v in all_vids:
-                v.setVisible(True)
+                v.setVisible(not v.data(8))
                 v.play()
             sc.exporting, sc.show_guides = False, old_guides
             sc.update()
         if canceled and not err:
             err = "Export cancelled."
-        sound = "original audio kept" if any(i["audio"] for i in infos.values()) else "no audio in the source video"
+        has_snd = [i for i in infos.values() if i["audio"]]
+        n_mut = sum(1 for i in has_snd if i["v"].muted)
+        if not has_snd:
+            sound = "no audio in the source video"
+        elif n_mut == len(has_snd):
+            sound = "all videos muted (no sound)"
+        elif n_mut:
+            sound = f"sound kept from {len(has_snd) - n_mut} video(s), {n_mut} muted"
+        else:
+            sound = "original audio kept"
         if level == -1:
             quality, note = "high-quality H.264 (graphics card encoder)", ""
         else:
@@ -7419,6 +9292,8 @@ class Main(QMainWindow):
             if done_vid:
                 lines.append(f"{done_vid} video slide(s): {vinfo}")
             lines.append("Files are numbered in slide order: slide_01, slide_02, ...")
+            if d.perf != "fast":
+                lines.append("Computer load: " + (limits.status if limits.status else "no limit could be applied on this PC") + ".")
             QMessageBox.information(self, "Done", "\n".join(lines))
 
     def duplicate(self):
@@ -7527,6 +9402,11 @@ class Main(QMainWindow):
             self.sync_pos(it)
         for s in sl:
             s.blockSignals(False)
+            self.show_slider_value(s)
+        self.prop_body.setVisible(it is not None)
+        self.prop_hint.setVisible(it is None)
+        self.sec_canvas.setVisible(it is None)         # slide size / count / background show when nothing is selected
+        self.update_context()
         if refresh and not self.syncing:
             self.refresh_layers()
 
@@ -7866,7 +9746,7 @@ if __name__ == "__main__":
     if sys.platform == "win32":        # own taskbar identity so Windows shows the Aero icon, not Python's
         try:
             import ctypes
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Winserendipity.Aero.Beta")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Winserendipity.Aero")
         except Exception:
             pass
     app = QApplication(sys.argv)

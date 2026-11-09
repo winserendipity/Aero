@@ -1,4 +1,3 @@
-[README.md](https://github.com/user-attachments/files/34579016/README.md)
 <p align="center">
   <img src="assets/aero_icon_256.png" alt="Aero logo" width="140">
 </p>

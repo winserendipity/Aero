@@ -48,8 +48,6 @@
 
 **Aero** is a desktop photo editor made for building **seamless carousel albums**: the swipeable multi-photo posts on Instagram, Facebook and Threads where one picture, one design or one story flows across several slides.
 
-**No Paywall. No Subscription. No Account Needed. No Watermarks. Just unleash your creativity.**
-
 You work on one wide canvas that is cut into slides. A photo, a line of text or a shape can sit across the cut between two slides, and when the post is swiped it lines up perfectly. Aero adds a full photo-editing toolkit on top: film emulation, colour grading, cropping, background tools, collage grids and templates.
 
 ## Purpose
@@ -97,7 +95,7 @@ Aero is built and tested for Windows 11 desktop. It does not need a GPU or an in
 - These figures are estimates from the app's design, not formal benchmarks. Real speed depends on photo size, number of layers and filters.
 - **GPU drawing** is on by default and can be switched off in **File > Settings > General**. If a graphics problem is detected at startup, Aero turns it off automatically.
 - Photo filters, video filters and exporting use the **processor** (several cores). The GPU makes panning, zooming and dragging smoother.
-- Video export is near-lossless, so files are large and rendering takes time. Plan free disk space accordingly. Video slides are exported at up to 2x (for example 2160 x 2700 px), even when images use a higher resolution, which keeps the encoder to roughly 1 GB of memory.
+- Video export is near-lossless, so files are large and rendering takes time. Plan free disk space accordingly. Video slides are exported at the slide's own size by default (for example 1080 x 1350 px, the size Instagram, Facebook and Threads actually show); the export window's **Video size** option can raise this to double (2160 x 2700 px), which makes bigger files and takes about four times the work.
 - Some videos (HEVC / H.265) may need the Microsoft "HEVC Video Extensions" from the Microsoft Store.
 - No internet connection is needed to use Aero.
 
@@ -221,7 +219,7 @@ More than **230 looks**, searchable and grouped by category:
 
 ### Video
 
-- **Add Video** (next to **Add Image**, in the toolbar and the Insert menu) puts a video layer on the canvas; it plays in the editor.
+- **Add Video** (next to **Add Image**, in the toolbar and the Insert menu) puts a video layer on the canvas. It shows its first frame and stays paused while you edit (no extra processor load or heat); use **Play / Pause** in the right-click menu or the options bar to watch it. Videos also pause by themselves when another program is in front, and play in the full-screen preview.
 - Right-click a video for **Crop Video**, **Trim Video Length**, **Edit Video (Filters)**, **Play / Pause**, **Mute this video** and **Sound only from this video**.
 - **Crop Video:** crop on the spot with the same box, snapping and panel as photos.
 - **Trim Video Length:** keep only the part of the clip you want, with start and end sliders.
@@ -238,7 +236,7 @@ The **Export** dialog is built around keeping every detail:
 - **Video encoder:** *Best quality - processor* (default, near-lossless H.264) or *Much faster - graphics card* (NVIDIA NVENC, high quality, hardly any processor use). If the graphics card cannot do it, Aero switches to the processor automatically.
 - **Speed:** video filters are computed on several threads at once (a few frames ahead), the colour maths of the filters is much faster, film grain and vignette are calculated once instead of for every frame, and a clip with fewer real pixels than the export size (for example 1080p saved at 2x) is filtered at its real size and enlarged afterwards. Filtered videos export several times faster than before.
 - **Progress bar:** one progress window for the whole export, with the current slide, overall percentage and time left. You can cancel at any time.
-- **Computer load:** *Balanced* (default) uses about half of your CPU cores at lower priority so the PC stays usable; *Gentle* uses 2 cores; *Fast* uses everything. On Windows, Balanced and Gentle also put a hard ceiling on total CPU use (about 50% and 2 cores' worth), so the processor and its temperature stay down even while saving HEIC or other large images. The message at the end of an export shows which limits were applied. Aero also checks free memory first and offers a lower resolution if the export would not fit.
+- **Computer load:** *Balanced* (default) keeps about a third of your processor busy, one thread on each of a few separate physical cores, at lower priority so the PC stays usable and cool; *Gentle* uses 2 cores; *Fast* uses everything. On Windows, Balanced and Gentle also put a hard ceiling on total CPU use. The export window shows which limits are in force while it runs, and the message at the end repeats them. Aero also checks free memory first and offers a lower resolution if the export would not fit.
 - Text, shapes and grid photos are rendered at the export resolution, so fonts stay crisp.
 - Each slide is saved as its own numbered file (`slide_01`, `slide_02`, ...) in the folder you choose. Slides with video become `.mp4` files in the same folder.
 - Transparent areas are kept in PNG, TIFF and WebP.

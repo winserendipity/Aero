@@ -7,6 +7,7 @@ import os, sys, json, base64, uuid, math, random, hashlib, time, shutil, subproc
 for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):     # numpy's helper libraries otherwise spin on every core
     os.environ.setdefault(_v, str(max(1, min(4, (os.cpu_count() or 4) // 3))))
 from concurrent.futures import ThreadPoolExecutor
+import collections
 from pathlib import Path
 
 from PySide6.QtGui import QCursor
@@ -72,6 +73,61 @@ def to_pixmap(raw):
     rd.setAutoTransform(True)
     img = rd.read()
     return QPixmap.fromImage(img) if not img.isNull() else QPixmap()
+
+
+def install_crash_log():
+    """The installed program has no console, so a crash leaves no trace. Write Python errors and native crashes to
+    aero-log.txt in Aero's data folder (shown in Settings > About)."""
+    try:
+        import faulthandler, traceback, datetime
+        d = Path(QStandardPaths.writableLocation(QStandardPaths.AppDataLocation))
+        d.mkdir(parents=True, exist_ok=True)
+        path = d / "aero-log.txt"
+        if path.exists() and path.stat().st_size > 400_000:
+            path.write_text("", encoding="utf-8")
+        f = open(path, "a", buffering=1, encoding="utf-8")
+        f.write(f"\n--- Aero {APP_BUILD} started {datetime.datetime.now():%Y-%m-%d %H:%M:%S} ---\n")
+        faulthandler.enable(f, all_threads=True)           # a hard crash writes the stack of every thread here
+        old = sys.excepthook
+
+        def hook(t, v, tb):
+            try:
+                f.write("".join(traceback.format_exception(t, v, tb)))
+            except Exception:
+                pass
+            old(t, v, tb)
+        sys.excepthook = hook
+        globals()["LOG_PATH"] = str(path)
+    except Exception:
+        pass
+
+
+class KeepAlive:
+    """While open, Qt does not quit just because the last visible window closed. Needed when a progress window or message
+    box is the only window on screen (the editor is hidden behind the opening menu): without it, closing that little
+    window ended the whole program."""
+    def __enter__(self):
+        self.prev = QApplication.quitOnLastWindowClosed()
+        QApplication.setQuitOnLastWindowClosed(False)
+        return self
+
+    def __exit__(self, *exc):
+        QApplication.setQuitOnLastWindowClosed(self.prev)
+        return False
+
+
+class PhotoItem(QGraphicsPixmapItem):
+    """A photo layer. A photo can be drawn from a smaller, screen-sized copy (device-pixel ratio below 1) that still has the
+    layer's full logical size; Qt works out the clickable area of a plain pixmap item from the stored pixels, which would
+    leave only the top-left part clickable. This one always uses its full logical rectangle."""
+
+    def shape(self):
+        p = QPainterPath()
+        p.addRect(self.boundingRect())
+        return p
+
+    def contains(self, point):
+        return self.boundingRect().contains(point)
 
 
 def apply_flip(it):
@@ -473,10 +529,14 @@ def frame_pixmap(img, crop, adj, maxdim=None):
 _WORKERS = weakref.WeakSet()
 
 
+_DYING = []          # video threads asked to stop: kept referenced until they really end (Qt aborts if a running thread is freed)
+_DORMANT = []        # (video layer, time): layers taken off the canvas, kept for a while so undo / redo can reuse them
+
+
 def stop_all_video_workers():
     for w in list(_WORKERS):
         try:
-            w.shutdown()
+            w.shutdown(wait=True)
         except Exception:
             pass
 
@@ -488,17 +548,40 @@ _SWEEP = {"timer": None}
 
 
 def _sweep_workers():
-    """Stop the thread of any video layer that no longer exists (deleted, undone, scene cleared)."""
+    """Housekeeping once a second, never blocking: end the threads of layers that were thrown away, forget threads that
+    have finished."""
+    now = time.monotonic()
+    for entry in list(_DORMANT):
+        it, t = entry
+        if now - t > 45:
+            _DORMANT.remove(entry)
+            it.worker.shutdown()
+    while len(_DORMANT) > 4:
+        it, _ = _DORMANT.pop(0)
+        it.worker.shutdown()
     for entry in list(_WATCH):
         w, ref = entry
         it = ref()
         try:
-            gone = it is None or (it.scene() is None and it.was_in_scene)
+            gone = it is None or (it.scene() is not None and False)
         except RuntimeError:
             gone = True
         if gone:
             w.shutdown()
             _WATCH.remove(entry)
+    for w in list(_DYING):
+        if not w.isRunning():
+            _DYING.remove(w)
+
+
+def take_dormant_video(path):
+    """A video layer with this file that was just taken off the canvas (undo / redo / reopen): reuse it instead of
+    starting a new decoder thread."""
+    for entry in _DORMANT:
+        if entry[0].path == path:
+            _DORMANT.remove(entry)
+            return entry[0]
+    return None
 
 
 def watch_worker(worker, item):
@@ -511,6 +594,16 @@ def watch_worker(worker, item):
         _SWEEP["timer"] = t
 
 if HAS_VIDEO:
+    _FILTER_POOL = {"p": None, "n": 1}
+
+    def filter_pool():
+        """ONE pool of filter threads shared by every playing video, so several filtered videos do not each start their
+        own threads and fight for the processor."""
+        if _FILTER_POOL["p"] is None:
+            _FILTER_POOL["n"] = max(2, min(6, (os.cpu_count() or 4) // 2))
+            _FILTER_POOL["p"] = ThreadPoolExecutor(max_workers=_FILTER_POOL["n"])
+        return _FILTER_POOL["p"], _FILTER_POOL["n"]
+
     class VideoWorker(QThread):
         """Decodes, crops, filters and paces one video on its own thread, so the editor never waits for a frame.
         The window only receives finished pictures (queued signal) - no decoding or filtering happens on the GUI thread."""
@@ -521,7 +614,7 @@ if HAS_VIDEO:
             super().__init__()
             self.path = path
             self.crop, self.adj, self.trim = None, {}, None
-            self.playing, self.seek_to, self.redo, self.stop_flag = True, None, False, False
+            self.playing, self.seek_to, self.redo, self.stop_flag = False, None, False, False     # paused until the user plays it
             self.dur_ms, self.fps, self.pos_ms, self.W, self.H = 0, 30.0, 0, 0, 0
             self.raw = None                      # last decoded full-size frame (BGR)
             self.wake = threading.Event()
@@ -532,20 +625,28 @@ if HAS_VIDEO:
             self.lock = threading.Lock()
             self.pool = None
             self.settle = False
-            self.pool_n = max(1, min(4, (os.cpu_count() or 2) // 2))
+            self.pool_n = 2                      # filtered frames this video may have in flight at once
+            self.last_paint = time.monotonic()   # the canvas draws the video: when it stops doing so, it is out of view
             _WORKERS.add(self)
 
-        def shutdown(self):
+        def shutdown(self, wait=False):
+            """Ask the thread to end. Never waits on the GUI thread (a thread busy decoding a 4K frame would freeze the
+            window); `wait` is only used when the program quits."""
             self.stop_flag = True
             self.wake.set()
             if self.isRunning() and QThread.currentThread() is not self:
-                self.wait(1500)
+                if self not in _DYING:
+                    _DYING.append(self)
+                if wait:
+                    self.wait(1500)
 
         def poke(self, **kw):
             for k, v in kw.items():
                 setattr(self, k, v)
             if kw.get("playing") is False:
                 self.settle = True
+            if kw.get("playing"):
+                self.last_paint = time.monotonic()       # grace time: a video the user just played is being watched
             self.wake.set()
 
         def frame_range(self):
@@ -599,8 +700,7 @@ if HAS_VIDEO:
                 self.ready.emit(self.make_picture(fr), pos, self.W, self.H, self.seq)
                 return
             if self.pool is None:
-                from concurrent.futures import ThreadPoolExecutor
-                self.pool = ThreadPoolExecutor(max_workers=self.pool_n)
+                self.pool = filter_pool()[0]
             self.seq += 1
             with self.lock:
                 self.inflight += 1
@@ -612,7 +712,8 @@ if HAS_VIDEO:
                 img = self.make_picture(fr)
                 dt = time.perf_counter() - t0
                 self.avg = dt if self.avg == 0 else self.avg * 0.8 + dt * 0.2
-                budget = self.pool_n / self.fps                        # time each frame may take to keep real time
+                active = max(1, sum(1 for w in list(_WORKERS) if w.playing and w.adj and w.isRunning()))
+                budget = max(1.0, filter_pool()[1] / active) / self.fps          # each playing video gets its share of the filter threads
                 if self.avg > budget * 0.85:
                     self.lim = max(288, self.lim * 0.88)
                 elif self.avg < budget * 0.45 and self.lim < 640:
@@ -642,9 +743,19 @@ if HAS_VIDEO:
                 idx = a
                 cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
                 due = None
+                idle_t = None
+                if not self.playing and self.seek_to is None and self.raw is None:
+                    self.seek_to = self.trim[0] if self.trim else 0           # show the first picture, then wait
                 while not self.stop_flag:
                     a, b = self.frame_range()
+                    if cap is None and (self.playing or self.seek_to is not None):     # decoder was released while idle: open it again
+                        cap = cv2.VideoCapture(self.path)
+                        if not cap.isOpened():
+                            self.failed.emit(f"Could not open {Path(self.path).name}.")
+                            return
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
                     if self.seek_to is not None:
+                        idle_t = None
                         idx = min(max(int(self.seek_to / 1000.0 * self.fps), 0), max(self.n - 1, 0))
                         self.seek_to = None
                         cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
@@ -663,10 +774,17 @@ if HAS_VIDEO:
                         if self.settle and self.raw is not None:       # just paused: redraw this frame sharp
                             self.settle = False
                             self.emit_frame(self.raw, int(round(self.pos_ms / 1000.0 * self.fps)), sharp=True)
-                        self.wake.wait(0.05)
+                        if cap is not None:                            # paused for a while: give the decoder (memory, threads) back
+                            if idle_t is None:
+                                idle_t = time.monotonic()
+                            elif time.monotonic() - idle_t > 3.0:
+                                cap.release()
+                                cap = None
+                        self.wake.wait(0.25 if cap is None else 0.1)
                         self.wake.clear()
                         due = None
                         continue
+                    idle_t = None
                     now = time.monotonic()
                     if due is None:
                         due = now
@@ -683,6 +801,11 @@ if HAS_VIDEO:
                             cap.grab()
                             idx += 1
                         due += max(skip, 0) / self.fps
+                    if self.adj and time.monotonic() - self.last_paint > 0.6:     # filtered video out of view: keep time, skip the work
+                        cap.grab()
+                        idx += 1
+                        due += 1.0 / self.fps
+                        continue
                     if self.adj and self.inflight >= self.pool_n:      # filters are busy: skip this frame, keep real time
                         cap.grab()
                         idx += 1
@@ -698,9 +821,8 @@ if HAS_VIDEO:
                     self.submit_frame(fr, idx)
                     idx += 1
                     due += 1.0 / self.fps
-                cap.release()
-                if self.pool is not None:
-                    self.pool.shutdown(wait=False, cancel_futures=True)
+                if cap is not None:
+                    cap.release()
             except Exception as e:
                 self.failed.emit(f"Video playback stopped: {e}")
 
@@ -757,11 +879,15 @@ if HAS_VIDEO:
             if change == QGraphicsItem.ItemSceneHasChanged:
                 if value is not None:
                     self.was_in_scene = True
-                if value is not None and not self.worker.isRunning():
-                    self.worker.stop_flag = False
-                    self.worker.start()
+                    _DORMANT[:] = [e for e in _DORMANT if e[0] is not self]
+                    if not self.worker.isRunning():
+                        self.worker.stop_flag = False
+                        self.worker.start()
                 elif value is None:
-                    self.worker.shutdown()       # removed from the canvas (delete / undo): stop its thread
+                    # removed from the canvas (delete / undo / redo): do not start over next time, keep the thread idle for
+                    # reuse; the housekeeping timer ends it if nobody wants it back
+                    self.worker.poke(playing=False)
+                    _DORMANT.append((self, time.monotonic()))
             return super().itemChange(change, value)
 
         # ---- geometry
@@ -784,10 +910,37 @@ if HAS_VIDEO:
             return self.worker.dur_ms
 
         def pause(self):
+            self._resume = self.worker.playing
             self.worker.poke(playing=False)
+
+        def resume(self):
+            """Back to what it was doing before pause() (so a video the user had paused stays paused)."""
+            if getattr(self, "_resume", False):
+                self.worker.poke(playing=True)
+            self._resume = False
 
         def play(self):
             self.worker.poke(playing=True)
+
+        def reuse(self, size, crop, adj, trim, muted):
+            """A layer kept from before an undo / redo gets its saved settings back (no new decoder thread)."""
+            self.prepareGeometryChange()
+            self._size = QSizeF(size)
+            self.muted = bool(muted)
+            a = json.dumps(adj or {})
+            changed = crop != self.crop or a != self.data(5)
+            trim = tuple(trim) if trim else None
+            tchanged = trim != self.trim
+            self.crop, self.trim = crop, trim
+            self.setData(5, a)
+            self.setData(8, False)
+            self.setVisible(True)
+            self.worker.crop, self.worker.adj, self.worker.trim = crop, self.adj(), trim
+            self._still = None
+            if tchanged:
+                self.worker.poke(seek_to=trim[0] if trim else 0)
+            elif changed:
+                self.worker.poke(redo=True)
 
         def toggle_play(self):
             self.worker.poke(playing=not self.worker.playing)
@@ -836,6 +989,7 @@ if HAS_VIDEO:
         def paint(self, p, opt, w=None):
             r = self.boundingRect()
             sc = self.scene()
+            self.worker.last_paint = time.monotonic()
             if getattr(sc, "exporting", False) and not getattr(sc, "live_preview", False) and self.worker.raw is not None:     # still-image export: full detail
                 key = (self.worker.pos_ms, json.dumps(self.crop), self.data(5))
                 if self._still is None or self._still[0] != key:
@@ -3991,6 +4145,11 @@ class PreviewWindow(QWidget):
         self.hint_timer.timeout.connect(self.hide_hint)
         self.hint_timer.start(3500)
         self.has_video = HAS_VIDEO and any(isinstance(i, VideoItem) for i in sc.items())
+        self.vstate = []
+        if self.has_video:                       # videos play while previewing; afterwards each goes back to how it was
+            for v in [i for i in sc.items() if isinstance(i, VideoItem) and i.isVisible()]:
+                self.vstate.append((v, v.worker.playing))
+                v.play()
         self.last_draw = 0.0
         if self.has_video:                       # repaint when a video frame arrives (not on a blind timer) ...
             sc.changed.connect(self.on_scene_changed)
@@ -4099,6 +4258,12 @@ class PreviewWindow(QWidget):
 
     def closeEvent(self, e):
         self.anim.stop()
+        for v, was in self.vstate:
+            try:
+                v.worker.poke(playing=was)
+            except RuntimeError:
+                pass
+        self.vstate = []
         if self.has_video:
             try:
                 self.sc.changed.disconnect(self.on_scene_changed)
@@ -4279,8 +4444,9 @@ def est_export_mb(fmt, W, H, video=False):
 VIDEO_MAX_SCALE = 2      # video slides are never exported larger than 2x: bigger needs many GB for the encoder and no phone plays it
 
 
-def video_scale(scale):
-    return min(scale, VIDEO_MAX_SCALE)
+def video_scale(scale, cap=VIDEO_MAX_SCALE):
+    """Size of video slides: the chosen resolution, but never above `cap` (1 = the slide's own size, 2 = double)."""
+    return min(scale, cap, VIDEO_MAX_SCALE)
 
 
 def est_video_mb(W, H):
@@ -4348,15 +4514,26 @@ class ExportLimits:
         self.cv_threads = None
 
     def want(self, n):
-        return n if self.mode == "fast" else (min(2, n) if self.mode == "gentle" else max(1, n // 2))
+        """Threads to use. The heat of a processor comes from its physical cores, not from the 'CPU %' in Task Manager
+        (a core running two threads shows 100% but one core running one thread shows 50%, and both are hot). Balanced
+        therefore keeps about a third of the logical CPUs busy: one thread on each of about two thirds of the cores' worth."""
+        if self.mode == "fast":
+            return n
+        if self.mode == "gentle":
+            return min(2, n)
+        phys = n // 2 if (n >= 4 and n % 2 == 0) else n
+        return max(2 if n >= 4 else 1, int(round(phys * 2 / 3.0)))
 
     def pick(self, cpus):
         n = len(cpus)
         want = self.want(n)
+        cpus = list(cpus)
         if want >= n:
-            return list(cpus)
-        step = max(1, n // want)          # every other logical CPU = one thread per physical core on SMT chips
-        return list(cpus)[::step][:want]
+            return cpus
+        if n >= 4 and n % 2 == 0 and want <= n // 2:
+            return cpus[::2][:want]       # Windows lists the two threads of a core next to each other: one thread per core
+        step = max(1, n // want)
+        return cpus[::step][:want]
 
     def __enter__(self):
         notes = []
@@ -4448,6 +4625,7 @@ class ExportProgress:
     """One progress bar for the whole export: overall percentage, what is happening now, time left. Cancel supported."""
     def __init__(self, parent, total_units):
         self.total, self.done, self.t0 = max(1, total_units), 0.0, time.monotonic()
+        self.note = ""                                   # e.g. which computer-load limits are in force
         self.dlg = QProgressDialog("Starting export...", "Cancel", 0, 1000, parent)
         self.dlg.setWindowTitle("Exporting")
         self.dlg.setWindowModality(Qt.WindowModal)
@@ -4463,7 +4641,7 @@ class ExportProgress:
         f = self.done / self.total
         el = time.monotonic() - self.t0
         eta = f"   -   about {self.fmt_t(el * (1 - f) / f)} left" if f > 0.04 and el > 3 else ""
-        self.dlg.setLabelText(f"{text}\n{int(f * 100)}%{eta}")
+        self.dlg.setLabelText(f"{text}\n{int(f * 100)}%{eta}" + (f"\n{self.note}" if self.note else ""))
         self.dlg.setValue(int(f * 1000))
         QApplication.processEvents()
 
@@ -4714,8 +4892,24 @@ class ExportDialog(QDialog):
             vn.setWordWrap(True)
             vn.setStyleSheet("color: palette(mid);")
             lay.addWidget(vn)
-        self.venc = None
+        self.venc = self.vsz = None
+        self.vcap = 1
         if n_videos:
+            lay.addWidget(QLabel("Video size"))
+            self.vsz = QComboBox()
+            self.vsz.addItem(f"Slide size - {int(self.sc.pw)} x {int(self.sc.ph)} px (recommended)", 1)
+            self.vsz.addItem(f"Double size - {int(self.sc.pw * 2)} x {int(self.sc.ph * 2)} px (slower, hotter)", 2)
+            try:
+                self.vsz.setCurrentIndex(0 if int(cfg().value("export_video_cap", 1)) <= 1 else 1)
+            except (TypeError, ValueError):
+                pass
+            self.vsz.currentIndexChanged.connect(self.info)
+            lay.addWidget(self.vsz)
+            vh = QLabel("Instagram, Facebook and Threads show video at 1080 px wide, so the slide's own size already gives the "
+                        "full quality they use: cooler and much faster. Double size makes bigger files and takes about four times the work.")
+            vh.setWordWrap(True)
+            vh.setStyleSheet("color: palette(mid);")
+            lay.addWidget(vh)
             lay.addWidget(QLabel("Video encoder"))
             self.venc = QComboBox()
             self.venc.addItem("Best quality - processor (recommended)", False)
@@ -4728,7 +4922,7 @@ class ExportDialog(QDialog):
             lay.addWidget(hint)
         lay.addWidget(QLabel("Computer load"))
         self.p = QComboBox()
-        self.p.addItem("Balanced - about half of your CPU (recommended)", "balanced")
+        self.p.addItem("Balanced - about 1/3 of your CPU, cooler (recommended)", "balanced")
         self.p.addItem("Gentle - 2 cores, best for working while it exports", "gentle")
         self.p.addItem("Fast - all CPU cores", "fast")
         lay.addWidget(self.p)
@@ -4747,8 +4941,12 @@ class ExportDialog(QDialog):
         go.setDefault(True)
         go.clicked.connect(self.go)
         lay.addWidget(go)
+        self.lay = lay
         self.format_changed()
-        self.setFixedHeight(self.sizeHint().height())
+
+    def fit_height(self):
+        """Wrapped notes change the needed height when the choices change."""
+        self.setFixedHeight(max(self.sizeHint().height(), self.lay.totalHeightForWidth(self.width())))
 
     def cur_fmt(self):
         return EXPORT_FORMATS[self.f.currentIndex()][1]
@@ -4773,14 +4971,16 @@ class ExportDialog(QDialog):
         txt = (f"Each slide is saved at {W} x {H} px. Text and shapes are drawn sharp at that size and photos keep "
                f"their full detail.")
         if self.n_videos:
-            vk = video_scale(k)
+            vk = video_scale(k, self.vsz.currentData() if self.vsz is not None else VIDEO_MAX_SCALE)
             mb = max(mb, est_video_mb(int(self.sc.pw * vk), int(self.sc.ph * vk)))
             txt += (f"  Video slides are saved at {int(self.sc.pw * vk)} x {int(self.sc.ph * vk)} px "
-                    f"({vk}x, the largest size that is safe for video).")
+                    f"({vk:g}x).")
         txt += f"  Estimated memory: about {mb / 1024:.1f} GB."
         if fmt in ("heic", "heif") and k >= 3:
             txt += "  HEIC / HEIF at this size is slow and memory-hungry; 2x is recommended."
         self.note.setText(txt)
+        if hasattr(self, "lay"):
+            self.fit_height()
 
     def choose(self):
         d = QFileDialog.getExistingDirectory(self, "Export to folder", self.loc.text())
@@ -4791,6 +4991,9 @@ class ExportDialog(QDialog):
         self.fmt = self.cur_fmt()
         self.scale = self.r.currentData() or self.auto_for(self.fmt)
         self.perf = self.p.currentData()
+        if self.vsz is not None:
+            self.vcap = self.vsz.currentData()
+            cfg().setValue("export_video_cap", self.vcap)
         self.gpu = bool(self.venc.currentData()) if self.venc is not None else False
         self.folder = self.loc.text().strip()
         try:
@@ -5672,6 +5875,8 @@ class SettingsDialog(QDialog):
         self.about_l.addRow(h)
         rows = [("Application", "Aero"), ("Build", APP_BUILD), ("Graphics", "\n".join(gpus) if gpus else "Not detected")]
         rows += list(specs.items()) + [("Engine", "Aero Image Processor")]
+        if globals().get("LOG_PATH"):
+            rows.append(("Error log", LOG_PATH))
         for k, val in rows:
             lb = QLabel(val)
             lb.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -6546,6 +6751,10 @@ class Main(QMainWindow):
         self.restoring = False
         self.clip, self.paste_n = None, 0
         self.thumbs = {}
+        self.pcache, self.pcache_bytes = collections.OrderedDict(), 0     # filtered screen versions of photos
+        self.full_quality = False                                     # True only while exporting
+        self.bg_paused = []                                           # videos paused because Aero went to the background
+        QTimer.singleShot(0, self.watch_app_state)
         self.crop_state = None
         self.view.on_key = self.crop_key
         self.view.on_context = self.canvas_menu
@@ -7314,12 +7523,16 @@ class Main(QMainWindow):
         elif t == "video":
             if not HAS_VIDEO:
                 return
-            it = VideoItem(d["path"], QSizeF(d["w"], d["h"]), crop=d.get("crop"), adj=d.get("adj"), trim=d.get("trim"), muted=d.get("muted", False))
+            it = take_dormant_video(d["path"]) if scene is None else None
+            if it is not None:
+                it.reuse(QSizeF(d["w"], d["h"]), d.get("crop"), d.get("adj"), d.get("trim"), d.get("muted", False))
+            else:
+                it = VideoItem(d["path"], QSizeF(d["w"], d["h"]), crop=d.get("crop"), adj=d.get("adj"), trim=d.get("trim"), muted=d.get("muted", False))
         else:
             pm = self.pixmaps.get(d["id"])
             if pm is None:
                 return
-            it = QGraphicsPixmapItem(pm)
+            it = PhotoItem(pm)
             it.setTransformationMode(Qt.SmoothTransformation)
             it.setShapeMode(QGraphicsPixmapItem.BoundingRectShape)
             it.setData(0, d["id"])
@@ -7353,6 +7566,9 @@ class Main(QMainWindow):
         if getattr(self, "adj_panel", None):
             self.adj_panel.close()
         s = self.scene
+        if HAS_VIDEO:                            # take video layers off the canvas first (not deleted): they are reused below
+            for it in [i for i in s.items() if isinstance(i, VideoItem)]:
+                s.removeItem(it)
         s.clear()
         s.pw, s.ph, s.n = snap["pw"], snap["ph"], snap["n"]
         s.bg = QColor(snap["bg"])
@@ -7522,13 +7738,21 @@ class Main(QMainWindow):
             self.open_path(path)
 
     def open_path(self, path):
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            with KeepAlive():
+                self._open_path(path)
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def _open_path(self, path):
         try:
             data = json.loads(Path(path).read_text(encoding="utf-8"))
             snap = data["canvas"]
             assets = {k: base64.b64decode(v) for k, v in data.get("assets", {}).items()}
-            pixmaps = {}
-            for k, b in assets.items():
-                pixmaps[k] = to_pixmap(b)
+            keys = list(assets)
+            res = self.decode_many([("raw", assets[k]) for k in keys], "Opening project")
+            pixmaps = {k: (r[1] if not isinstance(r, Exception) else QPixmap()) for k, r in zip(keys, res)}
         except (OSError, KeyError, ValueError) as ex:
             QMessageBox.critical(self, "Open failed", f"Not a valid project file.\n{ex}")
             return
@@ -7570,6 +7794,70 @@ class Main(QMainWindow):
         pm = to_pixmap(raw)
         return (raw, pm) if not pm.isNull() else None
 
+    def decode_many(self, jobs, label="Opening photos"):
+        """Open several photos at once. jobs = [("file", path) | ("raw", bytes), ...]. The slow parts (HEIC conversion,
+        JPEG decoding of 12-48 megapixel pictures) run on helper threads while the window keeps answering Windows, so it
+        never shows 'Not Responding'. Returns, per job, (bytes, QPixmap) or the Exception that happened."""
+        def work(j):
+            kind, v = j
+            try:
+                raw = read_image(v) if kind == "file" else v
+                buf = QBuffer()
+                buf.setData(raw)
+                buf.open(QIODevice.ReadOnly)
+                rd = QImageReader(buf)
+                rd.setAutoTransform(True)
+                img = rd.read()
+                if img.isNull():
+                    raise ValueError("this file could not be read as a picture")
+                return raw, img
+            except Exception as ex:
+                return ex
+        n = len(jobs)
+        out = [None] * n
+        if not n:
+            return out
+        with KeepAlive():
+            return self._decode_many(jobs, work, label, out)
+
+    def _decode_many(self, jobs, work, label, out):
+        n = len(jobs)
+        pool = ThreadPoolExecutor(max_workers=max(1, min(3, (os.cpu_count() or 2) // 2, n)))
+        futs = [pool.submit(work, j) for j in jobs]
+        dlg, t0 = None, time.monotonic()
+        try:
+            for i, f in enumerate(futs):
+                while not f.done():
+                    if dlg is None and time.monotonic() - t0 > 0.4 and self.isVisible():     # no extra window over the opening menu
+                        dlg = QProgressDialog(f"{label}...", "", 0, n, self)
+                        dlg.setCancelButton(None)
+                        dlg.setWindowTitle("Aero")
+                        dlg.setWindowModality(Qt.WindowModal)
+                        dlg.setMinimumDuration(0)
+                    if dlg is not None:
+                        dlg.setMaximum(n)
+                        dlg.setValue(i)
+                        dlg.setLabelText(f"{label} ({i + 1} of {n})...")
+                    QApplication.processEvents()
+                    time.sleep(0.02)
+                r = f.result()
+                out[i] = r if isinstance(r, Exception) else (r[0], QPixmap.fromImage(r[1]))
+        finally:
+            pool.shutdown(wait=False)
+            if dlg is not None:
+                dlg.close()
+        return out
+
+    def report_decode(self, jobs, results):
+        """One message for every photo that could not be opened."""
+        bad = [(j, r) for j, r in zip(jobs, results) if isinstance(r, Exception)]
+        if not bad:
+            return
+        if any(isinstance(r, ImportError) for _, r in bad):
+            QMessageBox.warning(self, "HEIC support", "HEIC photos need two extra packages:\n\npip install pillow pillow-heif")
+            return
+        QMessageBox.warning(self, "Can't open image", "\n".join(f"{Path(j[1]).name if j[0] == 'file' else 'image'}: {r}" for j, r in bad[:6]))
+
     def video_error(self, msg):
         QMessageBox.warning(self, "Video problem", msg + "\n\nH.264 and HEVC/H.265 (iPhone) videos normally play "
                             "through Qt's built-in FFmpeg backend. If this one doesn't, run: pip install -U PySide6. "
@@ -7577,17 +7865,20 @@ class Main(QMainWindow):
 
     def add_image(self):
         files, _ = QFileDialog.getOpenFileNames(self, "Add images", "", "Images (" + IMG_EXT + ")")
-        for f in files:
-            res = self.load_image(f)
-            if not res:
+        jobs = [("file", f) for f in files]
+        results = self.decode_many(jobs)
+        self.report_decode(jobs, results)
+        for res in results:
+            if not res or isinstance(res, Exception):
                 continue
             raw, pm = res
             iid = uuid.uuid4().hex[:10]
             self.assets[iid], self.pixmaps[iid] = raw, pm
-            it = QGraphicsPixmapItem(pm)
+            it = PhotoItem(pm)
             it.setData(0, iid)
             it.setShapeMode(QGraphicsPixmapItem.BoundingRectShape)
             it.setTransformationMode(Qt.SmoothTransformation)
+            self.refresh_image(it)                           # a very large photo is drawn from a screen-sized copy
             it.setScale(min(1.0, 0.8 * self.scene.pw / pm.width()))
             self.scene.add_item(it, self.view_center())
         self.commit()
@@ -7652,10 +7943,42 @@ class Main(QMainWindow):
         self.sync_pos(it)
         self.commit()
 
+    def trim_pcache(self):
+        while self.pcache_bytes > 500 * 1048576 and len(self.pcache) > 1:      # least recently used out
+            _, old = self.pcache.popitem(last=False)
+            self.pcache_bytes -= old.width() * old.height() * 4
+
+    DISPLAY_MAX = 2048                      # longest side of a filtered photo kept for drawing on screen
+    BIG_PHOTO, BIG_SHOW = 3584, 3072        # an unfiltered photo larger than BIG_PHOTO is drawn from a BIG_SHOW copy
+
     def process_image(self, orig, adj, crop, mid=None, preview=False):
-        """Original photo -> photo after mask / crop / adjustments (full resolution unless preview)."""
+        """Original photo -> photo after mask / crop / adjustments.
+        On screen a filtered photo is computed at DISPLAY_MAX pixels (or 1000 while a slider moves) and stored with a
+        device-pixel ratio, so the layer keeps its full logical size but only a fraction of the memory and filter time.
+        While exporting (full_quality) the full resolution is used. Finished screen versions are cached, so undo, redo,
+        duplicate and reopening do not filter again."""
+        full_q = getattr(self, "full_quality", False)
         if not adj and not crop and not mid:
-            return orig
+            if full_q or max(orig.width(), orig.height()) <= self.BIG_PHOTO:
+                return orig
+            key = ("big", orig.cacheKey())                        # huge unfiltered photo: draw a screen-sized copy
+            hit = self.pcache.get(key)
+            if hit is None:
+                hit = orig.scaled(self.BIG_SHOW, self.BIG_SHOW, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                hit.setDevicePixelRatio(hit.width() / orig.width() * (1 + 1e-9))
+                self.pcache[key] = hit
+                self.pcache_bytes += hit.width() * hit.height() * 4
+            self.pcache.move_to_end(key)
+            self.trim_pcache()
+            return hit
+        key = None
+        if adj and np is not None and not preview and not full_q:
+            key = (orig.cacheKey(), json.dumps(adj, sort_keys=True), json.dumps(crop), mid,
+                   self.pixmaps[mid].cacheKey() if mid and mid in self.pixmaps else 0)
+            hit = self.pcache.get(key)
+            if hit is not None:
+                self.pcache.move_to_end(key)
+                return hit
         img, W, H = orig.toImage(), orig.width(), orig.height()
         if mid and mid in self.pixmaps:                       # Remove Background / Cut out / Erase result
             mk = self.pixmaps[mid].toImage()
@@ -7670,12 +7993,71 @@ class Main(QMainWindow):
             img = img.copy(x0, y0, max(1, int(crop[2] * W) - x0), max(1, int(crop[3] * H) - y0))
         if adj and np is not None:
             full = img.size()
-            if preview and max(full.width(), full.height()) > 1000:
-                img = img.scaled(1000, 1000, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            cap = 1000 if preview else (0 if full_q else self.DISPLAY_MAX)
+            if cap and max(full.width(), full.height()) > cap:
+                img = img.scaled(cap, cap, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             rgb, alpha = qimage_to_np(img)
             pm = np_to_pixmap(adjust_rgb(rgb, adj), alpha)
-            return pm if pm.size() == full else pm.scaled(full, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
-        return QPixmap.fromImage(img)
+            if pm.size() != full:
+                pm.setDevicePixelRatio(pm.width() / max(full.width(), 1) * (1 + 1e-9))      # logical size = the full size (nudge: float rounding)
+            if key is not None:
+                self.pcache[key] = pm
+                self.pcache_bytes += pm.width() * pm.height() * 4
+                self.trim_pcache()
+            return pm
+        pm = QPixmap.fromImage(img)                          # cropped / cut-out only
+        if not full_q and max(pm.width(), pm.height()) > self.BIG_PHOTO:
+            small = pm.scaled(self.BIG_SHOW, self.BIG_SHOW, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            small.setDevicePixelRatio(small.width() / pm.width() * (1 + 1e-9))
+            return small
+        return pm
+
+    def watch_app_state(self):
+        QApplication.instance().applicationStateChanged.connect(self.app_state_changed)
+
+    def app_state_changed(self, state):
+        """Playing videos pause while another program is in front (no heat / fan noise from an app nobody is looking at)
+        and carry on when Aero comes back. Not while exporting: export manages the videos itself."""
+        if not HAS_VIDEO or self.scene.exporting or self.full_quality:
+            return
+        try:
+            if state != Qt.ApplicationActive:
+                for v in self.scene.items():
+                    if isinstance(v, VideoItem) and v.worker.playing:
+                        self.bg_paused.append(v)
+                        v.worker.poke(playing=False)
+            else:
+                for v in self.bg_paused:
+                    if v.scene() is self.scene:
+                        v.worker.poke(playing=True)
+                self.bg_paused = []
+        except RuntimeError:
+            self.bg_paused = []
+
+    def set_full_quality(self, on, progress=None):
+        """Export needs every filtered photo at its real size; on screen they are kept at DISPLAY_MAX."""
+        if self.full_quality == on:
+            return
+        self.full_quality = on
+        todo = []
+        for it in self.scene.items():
+            if isinstance(it, QGraphicsPixmapItem) and it.data(0) is not None:
+                todo.append(it)
+            elif isinstance(it, GridItem):
+                todo.append(it)
+        for n, it in enumerate(todo):
+            if progress is not None:
+                progress.update(0, f"Preparing photos at full quality ({n + 1} of {len(todo)})...")
+                if progress.canceled():
+                    break
+            if isinstance(it, GridItem):
+                for k in range(it.count()):
+                    if it.ids[k] and (it.adjs[k] or it.crops[k] or it.pms[k] is not self.pixmaps.get(it.ids[k])):
+                        it.pms[k] = self.cell_pixmap(it, k)
+                it.update()
+            else:
+                self.refresh_image(it)
+            QApplication.processEvents()
 
     def refresh_image(self, it, preview=False):
         if isinstance(it, CellRef):
@@ -7723,7 +8105,7 @@ class Main(QMainWindow):
             b = CropBox(W, H)
             b.set_ratio(cr.width() / max(cr.height(), 1))
             crop = [round(v, 6) for v in b.c]
-        proxy = QGraphicsPixmapItem(orig)
+        proxy = PhotoItem(orig)
         proxy.setTransformationMode(Qt.SmoothTransformation)
         proxy.setShapeMode(QGraphicsPixmapItem.BoundingRectShape)
         proxy.setData(0, iid)
@@ -8694,9 +9076,11 @@ class Main(QMainWindow):
             return
         empty = [i for i, x in enumerate(g.ids) if x is None]
         slots = empty if empty else list(range(len(g.ids)))     # fill empty cells first, else start over
-        for slot, f in zip(slots, files):
-            res = self.load_image(f)
-            if not res:
+        jobs = [("file", f) for f in files[:len(slots)]]
+        results = self.decode_many(jobs)
+        self.report_decode(jobs, results)
+        for slot, res in zip(slots, results):
+            if not res or isinstance(res, Exception):
                 continue
             raw, pm = res
             iid = uuid.uuid4().hex[:10]
@@ -8777,7 +9161,7 @@ class Main(QMainWindow):
         key = "vidcrop-" + uuid.uuid4().hex[:8]
         self.pixmaps[key] = pm
         crop = v.crop or [0, 0, 1, 1]
-        proxy = QGraphicsPixmapItem(pm)
+        proxy = PhotoItem(pm)
         proxy.setTransformationMode(Qt.SmoothTransformation)
         proxy.setShapeMode(QGraphicsPixmapItem.BoundingRectShape)
         proxy.setData(0, key)
@@ -8833,7 +9217,7 @@ class Main(QMainWindow):
             self.commit()
         else:
             v.set_trim(d.old)
-        v.play()
+        v.resume()
 
     def selected_videos(self):
         return [i for i in self.scene.selectedItems() if HAS_VIDEO and isinstance(i, VideoItem)]
@@ -9118,7 +9502,7 @@ class Main(QMainWindow):
         finally:
             for v in all_vids:
                 v.setVisible(not v.data(8))
-                v.play()
+                v.resume()
             sc.exporting, sc.show_guides = False, old_guides
             sc.update()
         if canceled and not err:
@@ -9239,7 +9623,7 @@ class Main(QMainWindow):
         while avail:
             need = est_export_mb(fmt, int(sc.pw * scale), int(sc.ph * scale)) + 1200
             if vmap:
-                vk = video_scale(scale)
+                vk = video_scale(scale, getattr(d, "vcap", VIDEO_MAX_SCALE))
                 need = max(need, est_video_mb(int(sc.pw * vk), int(sc.ph * vk)) + 1200)
             if need <= avail * 0.6 or scale <= 1:
                 break
@@ -9274,12 +9658,17 @@ class Main(QMainWindow):
         self.view.setUpdatesEnabled(False)           # the editor view behind the progress window does not need to redraw
         try:
             with limits:
-                if img_slides:
+                progress.note = "Computer load: " + (limits.status if limits.status else "no limit could be applied on this PC")
+                self.set_full_quality(True, progress)
+                if progress.canceled():
+                    err = "Export cancelled."
+                if img_slides and not err:
                     done_img, err = self.export_images(img_slides, fmt, scale, folder, progress, 0, per_slide, limits)
                 if not err and vmap:
-                    done_vid, verr, vinfo = self.render_video_slides(folder, video_scale(scale), vmap, infos, fps, frames, progress,
+                    done_vid, verr, vinfo = self.render_video_slides(folder, video_scale(scale, getattr(d, "vcap", VIDEO_MAX_SCALE)), vmap, infos, fps, frames, progress,
                                                                     len(img_slides) * per_slide, limits)
         finally:
+            self.set_full_quality(False)
             self.view.setUpdatesEnabled(True)
             progress.close()
             gc.collect()
@@ -9435,14 +9824,14 @@ class Main(QMainWindow):
                 if isinstance(it, QGraphicsPixmapItem):
                     w = it.sceneBoundingRect().width()
                     if w > 1:
-                        need = max(need, it.pixmap().width() / w)
+                        need = max(need, it.pixmap().deviceIndependentSize().width() / w)
                 elif isinstance(it, GridItem):
                     for i in range(it.count()):
                         pm = it.pms[i]
                         if pm is not None and not pm.isNull():
                             cw = it.mapToScene(it.cell_rect(i)).boundingRect().width()
                             if cw > 1:
-                                need = max(need, pm.width() / cw)
+                                need = max(need, pm.deviceIndependentSize().width() / cw)
             except RuntimeError:
                 pass
         return int(max(2, min(4, math.ceil(need))))
@@ -9750,7 +10139,9 @@ if __name__ == "__main__":
         except Exception:
             pass
     app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)     # Aero quits only on purpose (X on the opening menu / Exit), never because a small window closed
     app.setApplicationName(APP_NAME)
+    install_crash_log()
     app.setApplicationVersion(APP_BUILD)
     app.setWindowIcon(app_icon())      # every window / dialog inherits it
     apply_theme(app)

@@ -4288,9 +4288,10 @@ APP_NAME = "Aero"
 
 
 # ---------------------------------------------------------------- export (quality first)
-EXPORT_FORMATS = [("PNG  (lossless)", "png"), ("JPEG  (maximum quality)", "jpg"), ("JFIF  (maximum quality)", "jfif"),
-                  ("TIFF  (lossless)", "tiff"), ("WebP  (lossless)", "webp"), ("HEIC  (maximum quality)", "heic"),
-                  ("HEIF  (maximum quality)", "heif"), ("BMP  (uncompressed)", "bmp")]
+EXPORT_FORMATS = [("JPEG  (maximum quality - works everywhere, iPhone ready)", "jpg"), ("PNG  (lossless)", "png"),
+                  ("HEIC  (maximum quality - iPhone ready, smaller files)", "heic"), ("JFIF  (maximum quality)", "jfif"),
+                  ("TIFF  (lossless)", "tiff"), ("WebP  (lossless)", "webp"),
+                  ("HEIF  (lossless - huge, may not open on iPhone)", "heif"), ("BMP  (uncompressed)", "bmp")]
 
 
 def qimage_to_pil(img):
@@ -4335,7 +4336,14 @@ def save_image_hq(img, base, fmt):
                 pillow_heif.register_heif_opener()
             except ImportError:
                 return ("HEIC / HEIF export needs two small packages:\n\n    pip install pillow pillow-heif\n\n"
-                        "Nothing was exported. Pick PNG or TIFF (lossless) to export now.")
+                        "Nothing was exported. Pick JPEG or PNG to export now.")
+            if fmt == "heic":
+                # iPhone-ready: 8-bit 4:2:0 HEVC at the top quality setting. (The lossless 4:4:4 kind is what iPhones refuse.)
+                try:
+                    pil.save(str(path), "HEIF", quality=100, chroma=420)
+                except TypeError:
+                    pil.save(str(path), "HEIF", quality=100)
+                return None
             try:
                 pil.save(str(path), "HEIF", quality=-1)                # -1 = lossless
             except Exception:
@@ -4658,9 +4666,50 @@ class ExportProgress:
         self.dlg.close()
 
 
-def encoder_cmd(ff, W, H, fs, aud, out, level, threads=0):
-    """ffmpeg command line. level 0 = best (near-lossless H.264, original audio copied), 1 = plain H.264 (maximum compatibility),
-    2 = MPEG-4 part 2 (only if H.264 is missing from this ffmpeg)."""
+VIDEO_FORMATS = [("H.264 MP4 - iPhone & Instagram (recommended)", "h264"),
+                 ("HEVC / H.265 MP4 - iPhone ready, half the size", "hevc"),
+                 ("Maximum - near-lossless H.264 (huge, may not import)", "max")]
+VIDEO_QUALITIES = [("High", "high"), ("Maximum (big files)", "max"), ("Smaller files", "small")]
+
+
+def fps_val(fs):
+    try:
+        a, _, b = str(fs).partition("/")
+        return float(a) / float(b) if b else float(a)
+    except (ValueError, ZeroDivisionError):
+        return 30.0
+
+
+def video_rate_mbps(vfmt, vq, W, H, fps):
+    """Bitrate ceiling (Mbit/s) for iPhone-ready video: grows with the picture size and frame rate, never above what an iPhone's
+    own camera records. None = no ceiling (near-lossless)."""
+    if vfmt == "max":
+        return None
+    base = {"small": 14.0, "high": 30.0, "max": 55.0}.get(vq, 30.0)
+    r = base * (W * H * fps) / (1080 * 1350 * 30.0)
+    if vfmt == "hevc":
+        r *= 0.6
+    return max(6.0, min(r, 100.0 if vfmt == "h264" else 80.0))
+
+
+def safe_fps(W, H, fps, vfmt):
+    """iPhones decode H.264 / HEVC up to level 5.2; a big picture at 60 fps is above that. Lower the rate only when needed."""
+    if vfmt == "max":
+        return fps
+    mbs = -(-W // 16) * -(-H // 16)
+    lim = 983040.0 / max(mbs, 1)
+    if fps <= lim:
+        return fps
+    for c in (60, 30, 25, 24, 15):
+        if c <= lim and c <= fps:
+            return float(c)
+    return 15.0
+
+
+def encoder_cmd(ff, W, H, fs, aud, out, level, threads=0, vfmt="max", vq="high"):
+    """ffmpeg command line. level 0 = best (processor: near-lossless H.264 for vfmt 'max', else iPhone-ready H.264 with a bitrate ceiling),
+    -1 = NVIDIA H.264, 3 = H.265 (HEVC) processor, 4 = HEVC NVIDIA, 1 = plain H.264 (maximum compatibility),
+    2 = MPEG-4 part 2 (only if H.264 is missing from this ffmpeg). Audio is copied when it is already AAC."""
     cmd = [ff, "-y", "-hide_banner", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "bgra",
            "-video_size", f"{W}x{H}", "-framerate", fs, "-i", "-"]
     for i in aud:
@@ -4670,20 +4719,40 @@ def encoder_cmd(ff, W, H, fs, aud, out, level, threads=0):
         cmd += ["-filter_complex", mix, "-map", "0:v:0", "-map", "[a]", "-c:a", "aac", "-b:a", "320k"]
     elif len(aud) == 1:
         cmd += ["-map", "0:v:0", "-map", "1:a:0"]
-        cmd += ["-c:a", "copy"] if (level <= 0 and aud[0]["audio"] == "aac") else ["-c:a", "aac", "-b:a", "320k"]
+        cmd += ["-c:a", "copy"] if (level in (0, -1, 3, 4) and aud[0]["audio"] == "aac") else ["-c:a", "aac", "-b:a", "320k"]
     else:
         cmd += ["-map", "0:v:0"]
+    fpsv = fps_val(fs)
+    if vfmt == "hevc" and level not in (3, 4):
+        vfmt = "h264"                                    # HEVC was not available: iPhone-ready H.264 instead
+    rate = video_rate_mbps(vfmt, vq, W, H, fpsv)
+    vbv = [] if rate is None else ["-maxrate", f"{int(rate * 1000)}k", "-bufsize", f"{int(rate * 2000)}k"]
+    crf = {"h264": {"small": 22, "high": 18, "max": 15}, "hevc": {"small": 26, "high": 22, "max": 18}}.get(vfmt, {}).get(vq, 18)
     x264 = "rc-lookahead=10:bframes=2:ref=3:sync-lookahead=0:frame-threads=%d" % min(max(threads, 1), 3)   # small look-ahead: far less memory
+    tv = "scale=out_color_matrix=bt709:out_range=tv,format=yuv420p"
+    col = ["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"]
     if level == -1:          # NVIDIA graphics card encoder: very fast, hardly any CPU, high quality (not mathematically near-lossless)
-        cmd += ["-c:v", "h264_nvenc", "-preset", "p6", "-tune", "hq", "-rc", "vbr", "-cq", "12", "-b:v", "0", "-profile:v", "high",
-                "-r", fs, "-vf", "scale=out_color_matrix=bt709:out_range=tv,format=yuv420p",
-                "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-movflags", "+faststart"]
+        cq = "12" if vfmt == "max" else str({"small": 24, "high": 20, "max": 16}.get(vq, 20))
+        cmd += ["-c:v", "h264_nvenc", "-preset", "p6", "-tune", "hq", "-rc", "vbr", "-cq", cq, "-b:v", "0", *vbv, "-profile:v", "high",
+                "-r", fs, "-vf", tv, *col, "-tag:v", "avc1", "-movflags", "+faststart"]
+    elif level == 4:         # HEVC on the NVIDIA card
+        cq = str({"small": 28, "high": 23, "max": 19}.get(vq, 23))
+        cmd += ["-c:v", "hevc_nvenc", "-preset", "p6", "-tune", "hq", "-rc", "vbr", "-cq", cq, "-b:v", "0", *vbv, "-profile:v", "main",
+                "-r", fs, "-vf", tv, *col, "-tag:v", "hvc1", "-movflags", "+faststart"]
+    elif level == 3:         # HEVC / H.265 on the processor
+        xp = "log-level=error:rc-lookahead=10:bframes=3" + (f":pools={int(threads)}:frame-threads={min(max(threads // 2, 1), 2)}" if threads else "")
+        cmd += ["-c:v", "libx265", "-preset", "veryfast", "-x265-params", xp, "-crf", str(crf), *vbv, "-profile:v", "main", "-r", fs,
+                "-vf", tv, *col, "-tag:v", "hvc1", "-movflags", "+faststart"]
     elif level == 0:
-        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-x264-params", x264, "-crf", "10", "-profile:v", "high", "-r", fs,
-                "-vf", "scale=out_color_matrix=bt709:out_range=tv,format=yuv420p",
-                "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-movflags", "+faststart"]
+        if vfmt == "max":
+            cmd += ["-c:v", "libx264", "-preset", "veryfast", "-x264-params", x264, "-crf", "10", "-profile:v", "high", "-r", fs,
+                    "-vf", tv, *col, "-movflags", "+faststart"]
+        else:
+            cmd += ["-c:v", "libx264", "-preset", "veryfast", "-x264-params", x264, "-crf", str(crf), *vbv, "-profile:v", "high", "-r", fs,
+                    "-vf", tv, *col, "-tag:v", "avc1", "-movflags", "+faststart"]
     elif level == 1:
-        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-x264-params", x264, "-crf", "10", "-pix_fmt", "yuv420p", "-r", fs, "-movflags", "+faststart"]
+        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-x264-params", x264, "-crf", "10" if vfmt == "max" else str(crf), *vbv,
+                "-pix_fmt", "yuv420p", "-r", fs, "-movflags", "+faststart"]
     else:
         cmd += ["-c:v", "mpeg4", "-q:v", "1", "-pix_fmt", "yuv420p", "-r", fs]
     if threads:
@@ -4697,16 +4766,20 @@ def run_hidden(cmd, low_priority=False, **kw):
     return subprocess.Popen(cmd, **kw)
 
 
-def preflight_encoder(ff, aud, fs, folder, gpu=False, size=(1080, 1350)):
+def preflight_encoder(ff, aud, fs, folder, gpu=False, size=(1080, 1350), vfmt="max", vq="high"):
     """Try a 3-frame test encode with the real settings; returns (level, log). Picks the best level that works.
     gpu=True tries the graphics-card encoder first (tested at the real video size)."""
     log = []
     test = Path(folder) / ".aero_encoder_test.mp4"
-    for level in ((-1, 0, 1, 2) if gpu else (0, 1, 2)):
+    if vfmt == "hevc":
+        order = (4, 3, -1, 0, 1, 2) if gpu else (3, 0, 1, 2)
+    else:
+        order = (-1, 0, 1, 2) if gpu else (0, 1, 2)
+    for level in order:
         ef = tempfile.TemporaryFile()
-        tw, th = (size[0], size[1]) if level == -1 else (128, 128)
+        tw, th = (size[0], size[1]) if level in (-1, 4) else (128, 128)
         try:
-            pc = run_hidden(encoder_cmd(ff, tw, th, fs, aud, test, level), stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=ef)
+            pc = run_hidden(encoder_cmd(ff, tw, th, fs, aud, test, level, 0, vfmt, vq), stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=ef)
             try:
                 pc.stdin.write(bytes(tw * th * 4 * 3))
                 pc.stdin.close()
@@ -4856,70 +4929,94 @@ class TrimDialog(QDialog):
 
 
 class ExportDialog(QDialog):
-    """Export: format, resolution, folder, how hard the PC may work. Quality first - nothing is compressed to save space."""
+    """Export: preset, photo format, resolution, video format / quality / size / frame rate, folder, how hard the PC may work.
+    Quality first - and the default preset makes files that import to an iPhone."""
+    PRESETS = [("iPhone, Instagram, Facebook & Threads (recommended)", "iphone"),
+               ("Maximum quality - archive / editing (huge files)", "max"),
+               ("Custom - my own choices below", "custom")]
+
     def __init__(self, parent, auto_scale, n_videos=0, video_slides=()):
         super().__init__(parent)
         self.n_videos, self.video_slides = n_videos, list(video_slides)
         self.setWindowTitle("Export")
-        self.setFixedWidth(480)
-        self.fmt, self.scale, self.folder, self.auto, self.perf, self.gpu = "png", 2, "", auto_scale, "balanced", False
+        self.setFixedWidth(500)
+        self.fmt, self.scale, self.folder, self.auto, self.perf, self.gpu = "jpg", 2, "", auto_scale, "balanced", False
+        self.vfmt, self.vq, self.vfps, self.vcap = "h264", "high", 0, 1.0
         self.sc = parent.scene
+        self.busy = True
         lay = QVBoxLayout(self)
         lay.setContentsMargins(24, 20, 24, 20)
-        lay.setSpacing(8)
-        lay.addWidget(QLabel("Format"))
+        lay.setSpacing(6)
+
+        def hint(text=""):
+            h = QLabel(text)
+            h.setWordWrap(True)
+            h.setStyleSheet("color: palette(mid);")
+            return h
+
+        lay.addWidget(QLabel("Export for"))
+        self.pre = QComboBox()
+        for label, key in self.PRESETS:
+            self.pre.addItem(label, key)
+        self.pre.currentIndexChanged.connect(self.preset_changed)
+        lay.addWidget(self.pre)
+        lay.addWidget(QLabel("Photo format"))
         self.f = QComboBox()
         for label, _ in EXPORT_FORMATS:
             self.f.addItem(label)
         self.f.currentIndexChanged.connect(self.format_changed)
         lay.addWidget(self.f)
-        lay.addWidget(QLabel("Resolution"))
+        lay.addWidget(QLabel("Photo resolution"))
         self.r = QComboBox()
         self.r.addItem("", 0)
         for k in (1, 2, 3, 4):
-            self.r.addItem(f"{k}x", k)
-        self.r.currentIndexChanged.connect(self.info)
+            self.r.addItem(f"{k}x  -  {int(self.sc.pw * k)} x {int(self.sc.ph * k)} px", k)
+        self.r.currentIndexChanged.connect(self.video_changed)
         lay.addWidget(self.r)
-        self.note = QLabel("")
-        self.note.setWordWrap(True)
-        self.note.setStyleSheet("color: palette(mid);")
+        self.note = hint()
         lay.addWidget(self.note)
+        self.venc = self.vsz = self.vf = self.vqc = self.vfp = None
+        self.vnote = None
         if n_videos:
             vs = ", ".join(str(k + 1) for k in self.video_slides)
-            vn = QLabel(f"This project has {n_videos} video(s) on slide(s) {vs}. Those slides are exported as MP4 "
-                        f"(near-lossless, original frame rate and sound); all other slides use the format above. "
-                        f"Everything goes into the same folder, numbered in slide order.")
-            vn.setWordWrap(True)
-            vn.setStyleSheet("color: palette(mid);")
-            lay.addWidget(vn)
-        self.venc = self.vsz = None
-        self.vcap = 1
-        if n_videos:
-            lay.addWidget(QLabel("Video size"))
+            lay.addWidget(hint(f"{n_videos} video(s) on slide(s) {vs} are exported as MP4 with the original sound; "
+                               f"all other slides use the photo format above."))
+            lay.addWidget(QLabel("Video format"))
+            self.vf = QComboBox()
+            for label, key in VIDEO_FORMATS:
+                self.vf.addItem(label, key)
+            self.vf.currentIndexChanged.connect(self.video_changed)
+            lay.addWidget(self.vf)
+            self.vnote = hint()
+            lay.addWidget(self.vnote)
+            self.vqc = QComboBox()
+            for label, key in VIDEO_QUALITIES:
+                self.vqc.addItem(label, key)
+            self.vqc.currentIndexChanged.connect(self.video_changed)
             self.vsz = QComboBox()
-            self.vsz.addItem(f"Slide size - {int(self.sc.pw)} x {int(self.sc.ph)} px (recommended)", 1)
-            self.vsz.addItem(f"Double size - {int(self.sc.pw * 2)} x {int(self.sc.ph * 2)} px (slower, hotter)", 2)
-            try:
-                self.vsz.setCurrentIndex(0 if int(cfg().value("export_video_cap", 1)) <= 1 else 1)
-            except (TypeError, ValueError):
-                pass
-            self.vsz.currentIndexChanged.connect(self.info)
-            lay.addWidget(self.vsz)
-            vh = QLabel("Instagram, Facebook and Threads show video at 1080 px wide, so the slide's own size already gives the "
-                        "full quality they use: cooler and much faster. Double size makes bigger files and takes about four times the work.")
-            vh.setWordWrap(True)
-            vh.setStyleSheet("color: palette(mid);")
-            lay.addWidget(vh)
-            lay.addWidget(QLabel("Video encoder"))
+            pw, ph = int(self.sc.pw), int(self.sc.ph)
+            self.vsz.addItem(f"Small  {int(pw * 2 / 3) // 2 * 2} x {int(ph * 2 / 3) // 2 * 2}", 2 / 3.0)
+            self.vsz.addItem(f"Slide  {pw} x {ph}", 1.0)
+            self.vsz.addItem(f"Double  {pw * 2} x {ph * 2}", 2.0)
+            self.vsz.setCurrentIndex(1)
+            self.vsz.currentIndexChanged.connect(self.video_changed)
+            self.vfp = QComboBox()
+            self.vfp.addItem("Same as source", 0)
+            self.vfp.addItem("At most 60 fps", 60)
+            self.vfp.addItem("At most 30 fps", 30)
+            self.vfp.addItem("At most 24 fps", 24)
+            self.vfp.currentIndexChanged.connect(self.video_changed)
             self.venc = QComboBox()
-            self.venc.addItem("Best quality - processor (recommended)", False)
-            self.venc.addItem("Much faster - graphics card (NVIDIA), if available", True)
-            lay.addWidget(self.venc)
-            hint = QLabel("The graphics-card encoder is very fast and keeps the processor free; the picture is still high quality "
-                          "but the files are not as near-lossless. If your card cannot do it, Aero uses the processor automatically.")
-            hint.setWordWrap(True)
-            hint.setStyleSheet("color: palette(mid);")
-            lay.addWidget(hint)
+            self.venc.addItem("Processor", False)
+            self.venc.addItem("NVIDIA card (faster)", True)
+            grid = QGridLayout()
+            grid.setHorizontalSpacing(10)
+            grid.setVerticalSpacing(4)
+            for c, (lbl, w) in enumerate((("Video quality", self.vqc), ("Video size (px)", self.vsz),
+                                          ("Frame rate", self.vfp), ("Video encoder", self.venc))):
+                grid.addWidget(QLabel(lbl), (c // 2) * 2, c % 2)
+                grid.addWidget(w, (c // 2) * 2 + 1, c % 2)
+            lay.addLayout(grid)
         lay.addWidget(QLabel("Computer load"))
         self.p = QComboBox()
         self.p.addItem("Balanced - about 1/3 of your CPU, cooler (recommended)", "balanced")
@@ -4942,7 +5039,77 @@ class ExportDialog(QDialog):
         go.clicked.connect(self.go)
         lay.addWidget(go)
         self.lay = lay
-        self.format_changed()
+        self.load_choices()
+        self.busy = False
+        self.refresh()
+
+    # --- choices
+    def set_combo(self, box, data):
+        if box is None:
+            return
+        i = box.findData(data)
+        if i >= 0:
+            box.setCurrentIndex(i)
+
+    def set_fmt(self, fmt):
+        for i, (_, k) in enumerate(EXPORT_FORMATS):
+            if k == fmt:
+                self.f.setCurrentIndex(i)
+
+    def load_choices(self):
+        """Last used choices (the preset 'iPhone' is the first-run default)."""
+        try:
+            c = cfg()
+            pre = str(c.value("export_preset", "iphone"))
+            self.set_combo(self.pre, pre)
+            if pre == "custom":
+                self.set_fmt(str(c.value("export_fmt", "jpg")))
+                self.r.setCurrentIndex(max(0, min(4, int(c.value("export_res", 2)))))
+                if self.vf is not None:
+                    self.set_combo(self.vf, str(c.value("export_vfmt", "h264")))
+                    self.set_combo(self.vqc, str(c.value("export_vq", "high")))
+                    self.vsz.setCurrentIndex(max(0, min(2, int(c.value("export_vsize", 1)))))
+                    self.set_combo(self.vfp, int(c.value("export_vfps", 0)))
+                return
+        except (TypeError, ValueError):
+            pass
+        self.apply_preset(self.pre.currentData())
+
+    def apply_preset(self, key):
+        self.busy = True
+        if key == "iphone":
+            self.set_fmt("jpg")
+            self.r.setCurrentIndex(2)                      # 2x = 2160 x 2700: sharper than Instagram's 1080 px, ready for the phone
+            if self.vf is not None:
+                self.set_combo(self.vf, "h264")
+                self.set_combo(self.vqc, "high")
+                self.vsz.setCurrentIndex(1)
+                self.set_combo(self.vfp, 0)
+        elif key == "max":
+            self.set_fmt("png")
+            self.r.setCurrentIndex(0)
+            if self.vf is not None:
+                self.set_combo(self.vf, "max")
+                self.set_combo(self.vqc, "max")
+                self.vsz.setCurrentIndex(1)
+                self.set_combo(self.vfp, 0)
+        self.busy = False
+
+    def preset_changed(self, *_):
+        self.apply_preset(self.pre.currentData())
+        self.refresh()
+
+    def to_custom(self):
+        """Any manual change of a photo / video choice turns the preset into 'Custom'."""
+        if self.busy or self.pre.currentData() == "custom":
+            return
+        self.busy = True
+        self.set_combo(self.pre, "custom")
+        self.busy = False
+
+    def video_changed(self, *_):
+        self.to_custom()
+        self.info()
 
     def fit_height(self):
         """Wrapped notes change the needed height when the choices change."""
@@ -4959,22 +5126,48 @@ class ExportDialog(QDialog):
         return self.auto
 
     def format_changed(self, *_):
+        self.to_custom()
+        self.refresh()
+
+    def refresh(self):
         k = self.auto_for(self.cur_fmt())
         self.r.setItemText(0, f"Best detail (automatic: {k}x)")
         self.info()
+
+    def video_dims(self, k):
+        vk = video_scale(k, self.vsz.currentData() if self.vsz is not None else VIDEO_MAX_SCALE)
+        return vk, int(self.sc.pw * vk) // 2 * 2, int(self.sc.ph * vk) // 2 * 2
 
     def info(self, *_):
         fmt = self.cur_fmt()
         k = self.r.currentData() or self.auto_for(fmt)
         W, H = int(self.sc.pw * k), int(self.sc.ph * k)
         mb = est_export_mb(fmt, W, H)
-        txt = (f"Each slide is saved at {W} x {H} px. Text and shapes are drawn sharp at that size and photos keep "
+        txt = (f"Photos are saved at {W} x {H} px. Text and shapes are drawn sharp at that size and photos keep "
                f"their full detail.")
+        if fmt == "heif" or fmt == "bmp":
+            txt += "  Very large files; iPhone Photos may not open this format."
         if self.n_videos:
-            vk = video_scale(k, self.vsz.currentData() if self.vsz is not None else VIDEO_MAX_SCALE)
-            mb = max(mb, est_video_mb(int(self.sc.pw * vk), int(self.sc.ph * vk)))
-            txt += (f"  Video slides are saved at {int(self.sc.pw * vk)} x {int(self.sc.ph * vk)} px "
-                    f"({vk:g}x).")
+            vk, VW, VH = self.video_dims(k)
+            mb = max(mb, est_video_mb(VW, VH))
+            if self.vf is not None:
+                vfmt, vq = self.vf.currentData(), self.vqc.currentData()
+                self.vqc.setEnabled(vfmt != "max")
+                self.venc.setEnabled(True)
+                rate = video_rate_mbps(vfmt, vq, VW, VH, 30.0)                 # shown for a 30 fps video; 60 fps may use up to twice
+                if vfmt == "max":
+                    vt = ("Near-lossless, the biggest files: a few minutes at 60 fps can reach several GB. iPhone Photos, Google Drive "
+                          "previews and Telegram (2 GB limit) often refuse them. Use it only for archive or editing.")
+                elif vfmt == "hevc":
+                    vt = (f"HEVC (H.265) keeps the same look in about half the size of H.264, and iPhones import it into Photos. "
+                          f"Video bitrate is capped at about {rate:.0f} Mbit/s for 30 fps (about {rate * 7.5:.0f} MB per minute at most). "
+                          f"Encoding on the processor is slower; an NVIDIA card is much faster.")
+                else:
+                    vt = (f"H.264 plays and imports everywhere: iPhone Photos, Instagram, Facebook, Threads, Windows, Android. "
+                          f"Video bitrate is capped at about {rate:.0f} Mbit/s for 30 fps (about {rate * 7.5:.0f} MB per minute at most), "
+                          f"so a file never grows into gigabytes.")
+                self.vnote.setText(vt)
+            txt += (f"  Video slides are saved at {VW} x {VH} px.")
         txt += f"  Estimated memory: about {mb / 1024:.1f} GB."
         if fmt in ("heic", "heif") and k >= 3:
             txt += "  HEIC / HEIF at this size is slow and memory-hungry; 2x is recommended."
@@ -4993,7 +5186,19 @@ class ExportDialog(QDialog):
         self.perf = self.p.currentData()
         if self.vsz is not None:
             self.vcap = self.vsz.currentData()
-            cfg().setValue("export_video_cap", self.vcap)
+            self.vfmt, self.vq, self.vfps = self.vf.currentData(), self.vqc.currentData(), int(self.vfp.currentData() or 0)
+        try:
+            c = cfg()
+            c.setValue("export_preset", self.pre.currentData())
+            c.setValue("export_fmt", self.fmt)
+            c.setValue("export_res", self.r.currentIndex())
+            if self.vsz is not None:
+                c.setValue("export_vfmt", self.vfmt)
+                c.setValue("export_vq", self.vq)
+                c.setValue("export_vsize", self.vsz.currentIndex())
+                c.setValue("export_vfps", self.vfps)
+        except Exception:
+            pass
         self.gpu = bool(self.venc.currentData()) if self.venc is not None else False
         self.folder = self.loc.text().strip()
         try:
@@ -9353,7 +9558,7 @@ class Main(QMainWindow):
             self.relayout(it)
             self.commit()
 
-    def prepare_videos(self, vmap):
+    def prepare_videos(self, vmap, fps_cap=0, size=None, vfmt="max"):
         """Read every video on the canvas once: frames, fps, kept range, sound. Returns (infos, fps, frames, error)."""
         infos = {}
         for k in sorted(vmap):
@@ -9373,6 +9578,10 @@ class Main(QMainWindow):
                 b = min(max(b, a + 1), n)
                 infos[v] = {"v": v, "n": n, "fps": fps_v, "a": a, "b": b, "audio": probe_audio(FFMPEG, v.path)}
         fps = max(i["fps"] for i in infos.values())
+        if fps_cap:
+            fps = min(fps, float(fps_cap))
+        if size:
+            fps = safe_fps(size[0], size[1], fps, vfmt)
         frames = max(1, min(int(round(max((i["b"] - i["a"]) / i["fps"] for i in infos.values()) * fps)), int(fps * 600)))
         return infos, fps, frames, None
 
@@ -9384,7 +9593,8 @@ class Main(QMainWindow):
         OW, OH = int(sc.pw * ex) // 2 * 2, int(sc.ph * ex) // 2 * 2
         auds = {k: [infos[v] for v in vmap[k] if infos[v]["audio"] and not v.muted] for k in vmap}
         gpu = bool(getattr(limits, "gpu", False))
-        level, log = preflight_encoder(FFMPEG, next((a for a in auds.values() if a), []), fs, folder, gpu, (OW, OH))
+        vfmt, vq = getattr(limits, "vfmt", "max"), getattr(limits, "vq", "high")
+        level, log = preflight_encoder(FFMPEG, next((a for a in auds.values() if a), []), fs, folder, gpu, (OW, OH), vfmt, vq)
         if level is None:
             return 0, ("The video encoder could not start.\n\nffmpeg: " + str(FFMPEG) + "\n\n" + "\n".join(log)), ""
         all_vids = list(infos)
@@ -9403,7 +9613,7 @@ class Main(QMainWindow):
                     break
                 out = Path(folder) / f"slide_{k + 1:02d}.mp4"
                 ef = tempfile.TemporaryFile()
-                pc = run_hidden(encoder_cmd(FFMPEG, OW, OH, fs, auds[k], out, level, limits.threads),
+                pc = run_hidden(encoder_cmd(FFMPEG, OW, OH, fs, auds[k], out, level, limits.threads, vfmt, vq),
                                 low_priority=limits.low_priority, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=ef)
                 caps, proxies, pool = {}, [], None
                 try:
@@ -9517,14 +9727,22 @@ class Main(QMainWindow):
             sound = f"sound kept from {len(has_snd) - n_mut} video(s), {n_mut} muted"
         else:
             sound = "original audio kept"
-        if level == -1:
-            quality, note = "high-quality H.264 (graphics card encoder)", ""
+        rate = video_rate_mbps(vfmt if (vfmt != "hevc" or level in (3, 4)) else "h264", vq, OW, OH, fps)
+        cap_txt = "" if rate is None else f", bitrate capped at {rate:.0f} Mbit/s"
+        note = ""
+        if level in (3, 4):
+            quality = "HEVC / H.265 (iPhone ready)" + (" on the graphics card" if level == 4 else "") + cap_txt
+        elif level == -1:
+            quality = ("H.264 (iPhone ready)" if vfmt != "max" else "high-quality H.264") + " on the graphics card" + cap_txt
         else:
-            quality = "near-lossless H.264"
-            note = "" if level == 0 else " (compatibility mode: this PC's encoder could not use the best settings)"
+            quality = "near-lossless H.264" if vfmt == "max" else "H.264 (iPhone ready)" + cap_txt
+            if vfmt == "hevc":
+                note = " (HEVC was not available in this PC's encoder: H.264 was used instead)"
+            elif level != 0:
+                note = " (compatibility mode: this PC's encoder could not use the best settings)"
             if gpu:
                 note += " (the graphics card encoder was not available, the processor was used)"
-        return done_n, err, f"videos {OW} x {OH} px, {fps:.3f} fps (same as the source), {quality}, {sound}{note}"
+        return done_n, err, f"videos {OW} x {OH} px, {fps:.3f} fps, {quality}, {sound}{note}"
 
     def export_images(self, slides, fmt, scale, folder, progress, base, per_slide, limits):
         """Photos / text slides: render on this thread, encode on a second thread, so the window and the progress bar
@@ -9645,7 +9863,9 @@ class Main(QMainWindow):
         img_slides = [i for i in range(sc.n * sc.rows) if i not in vmap]
         infos, fps, frames = {}, 30.0, 0
         if vmap:
-            infos, fps, frames, perr = self.prepare_videos(vmap)
+            vk0 = video_scale(scale, getattr(d, "vcap", VIDEO_MAX_SCALE))
+            infos, fps, frames, perr = self.prepare_videos(vmap, getattr(d, "vfps", 0),
+                                                           (int(sc.pw * vk0) // 2 * 2, int(sc.ph * vk0) // 2 * 2), getattr(d, "vfmt", "max"))
             if perr:
                 QMessageBox.warning(self, "Export", perr)
                 return
@@ -9654,6 +9874,7 @@ class Main(QMainWindow):
         done_img, err, done_vid, verr, vinfo = 0, None, 0, None, ""
         limits = ExportLimits(d.perf)
         limits.gpu = getattr(d, "gpu", False)
+        limits.vfmt, limits.vq = getattr(d, "vfmt", "max"), getattr(d, "vq", "high")
         progress = ExportProgress(self, total_units)
         self.view.setUpdatesEnabled(False)           # the editor view behind the progress window does not need to redraw
         try:

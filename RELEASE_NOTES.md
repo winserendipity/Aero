@@ -16,7 +16,8 @@ Aero is a Windows 11 desktop editor for seamless photo and video carousels on In
 
 ### New features
 - **Mute per video.** Each video has a *Sound on / Muted* button and right-click entries *Mute this video* and *Sound only from this video*. A muted video adds no sound to the exported slide; Layers shows "Muted". Saved with the project.
-- **Video encoder choice on export.** *Best quality – processor* (near-lossless H.264) or *Much faster – graphics card* (NVIDIA NVENC). Aero falls back to the processor if the graphics card cannot be used.
+- **iPhone-ready export.** New *Export for* presets, a *Video format* choice (H.264 MP4, HEVC / H.265 MP4 or Maximum near-lossless), *Video quality*, *Video size* (small / slide / double) and *Frame rate* options, a JPEG / HEIC photo format that opens on iPhone, and bitrate-capped video so files no longer grow to ~3 GB that Photos, Files, Drive and Telegram refuse.
+- **Video encoder choice on export.** *Processor* or *NVIDIA graphics card* (NVENC, H.264 or HEVC). Aero falls back to the processor if the graphics card cannot be used.
 - **Computer load control.** *Balanced* (about a third of the processor, one thread on each of a few physical cores), *Gentle* (2 cores) and *Fast* modes. On Windows, Balanced and Gentle apply a hard CPU ceiling and lower priority, so CPU use and temperatures stay down. The export window shows the limits in force; the final message repeats them.
 
 ### Faster, lighter exporting

@@ -14,7 +14,7 @@ from PySide6.QtGui import QCursor
 from PySide6.QtCore import QEvent, QThread, QObject, Signal, Slot, QEventLoop, QElapsedTimer, QPoint, Qt, QRectF, QPointF, QSizeF, QUrl, QBuffer, QIODevice, QSettings, QSize, QTimer, QVariantAnimation, QEasingCurve, QStandardPaths
 from PySide6.QtGui import (QColor, QPainter, QPen, QPixmap, QImage, QKeySequence,
                            QAction, QFont, QPolygonF, QLinearGradient, QBrush, QImageReader, QTransform, QIcon,
-                           QPainterPath, QPalette, QTextCursor, QTextBlockFormat, QTextCharFormat, QRadialGradient, QPainterPathStroker, QFontMetricsF)
+                           QPainterPath, QPalette, QTextCursor, QTextBlockFormat, QTextCharFormat, QRadialGradient, QPainterPathStroker, QFontMetricsF, QFontDatabase)
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QGraphicsScene, QGraphicsView, QGraphicsPixmapItem,
     QGraphicsTextItem, QToolBar, QFileDialog, QSizePolicy, QColorDialog, QFontDialog, QSpinBox,
@@ -199,6 +199,293 @@ def slider_spin(lay, label, lo, hi, on_value, on_release=None):
 ALIGNS = {"left": Qt.AlignLeft, "center": Qt.AlignHCenter, "right": Qt.AlignRight, "justify": Qt.AlignJustify}
 
 
+# ---------------------------------------------------------------- text effects / curve (drawn from the glyph outlines)
+TEXT_EFFECTS = [("None", "none"), ("Drop", "drop"), ("Glow", "glow"), ("Echo", "echo"), ("Outline", "outline"),
+                ("Background", "background"), ("Splice", "splice"), ("Hollow", "hollow"), ("Neon", "neon"), ("Glitch", "glitch")]
+# Advanced: ready-made looks = font + colours + effect. (name, preferred fonts, bold, effect, text colour, effect colour, amount)
+TEXT_STYLES = [
+    ("Neon Lights", ["Bahnschrift", "Segoe UI", "Arial"], False, "neon", "#ffe3fc", "#ff3cf0", 60),
+    ("TV Static", ["Arial Black", "Segoe UI Black", "Arial"], True, "glitch", "#f4ecff", "#00e0ff", 60),
+    ("70s", ["Cooper Black", "Bauhaus 93", "Georgia"], True, "retro", "#ffb81c", "#6b2a12", 50),
+    ("Sci-fi", ["Bahnschrift", "Consolas", "Segoe UI"], True, "glow", "#e8ffb8", "#7dff1a", 55),
+    ("Screenprint", ["Arial Black", "Impact", "Arial"], True, "extrude", "#fbe4ee", "#c2185b", 50),
+    ("Western", ["Brush Script MT", "Segoe Script", "Georgia"], False, "drop", "#d9786b", "#7a3b32", 50),
+    ("Graffiti", ["Segoe Print", "Ink Free", "Impact"], True, "graffiti", "#f4f4f4", "#1c1c1c", 50),
+    ("Bubble", ["Arial Rounded MT Bold", "Segoe UI Black", "Arial Black"], True, "bubble", "#37d6dc", "#0f4552", 50),
+    ("Aerobics", ["Segoe Script", "Brush Script MT", "Georgia"], False, "glow", "#fff0ff", "#d79cff", 50),
+    ("Arcade", ["Consolas", "Courier New", "Lucida Console"], True, "pixel", "#38ff2f", "#ff3df0", 50),
+    ("Cosmic", ["Segoe Script", "Brush Script MT", "Georgia"], False, "glow", "#ffffff", "#8f94ff", 70),
+    ("Pixel", ["Consolas", "Courier New", "Lucida Console"], True, "pixel", "#e9e6ff", "#ff2fb4", 50),
+]
+
+
+def text_blur(a, r):
+    """Fast separable box blur of a float32 image (cumulative sums); three passes look like a Gaussian."""
+    if r < 1:
+        return a
+    k = 2 * r + 1
+    for ax in (0, 1):
+        pad = [(0, 0), (0, 0)]
+        pad[ax] = (r + 1, r)
+        c = np.cumsum(np.pad(a, pad), axis=ax, dtype=np.float64)
+        hi = [slice(None), slice(None)]
+        lo = [slice(None), slice(None)]
+        hi[ax], lo[ax] = slice(k, None), slice(0, a.shape[ax])
+        a = ((c[tuple(hi)] - c[tuple(lo)]) / k).astype(np.float32)
+    return a
+
+
+def soft_copy(path, color, radius, scale):
+    """A blurred copy of a path in one colour: (QImage, QRectF in path units). Used for glow / neon / soft shadow."""
+    s = max(0.2, min(float(scale), 2.0))
+    pad = radius * 1.8 + 2
+    rect = path.boundingRect().adjusted(-pad, -pad, pad, pad)
+    while rect.width() * rect.height() * s * s > 5e6 and s > 0.1:
+        s *= 0.7
+    w, h = max(2, int(math.ceil(rect.width() * s))), max(2, int(math.ceil(rect.height() * s)))
+    img = QImage(w, h, QImage.Format_ARGB32_Premultiplied)
+    img.fill(0)
+    p = QPainter(img)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.scale(s, s)
+    p.translate(-rect.left(), -rect.top())
+    p.fillPath(path, QColor(255, 255, 255))
+    p.end()
+    stride = img.bytesPerLine() // 4
+    a = np.frombuffer(img.constBits(), np.uint8).reshape(h, stride, 4)[:, :w, 3].astype(np.float32) / 255.0
+    r = max(1, int(radius * s / 2.2))
+    for _ in range(3):
+        a = text_blur(a, r)
+    a = np.clip(a * 1.35, 0, 1)
+    out = np.zeros((h, w, 4), np.uint8)
+    out[..., 0], out[..., 1], out[..., 2] = color.blue() * a, color.green() * a, color.red() * a
+    out[..., 3] = a * 255 * (color.alpha() / 255.0)
+    out[..., :3] = (out[..., :3] * (color.alpha() / 255.0)).astype(np.uint8)
+    q = QImage(out.data, w, h, w * 4, QImage.Format_ARGB32_Premultiplied).copy()
+    return q, rect
+
+
+def pixel_copy(path, color, block):
+    """Path drawn as big square pixels: (QImage, QRectF, block size)."""
+    rect = path.boundingRect().adjusted(-block, -block, block, block)
+    w, h = max(1, int(math.ceil(rect.width() / block))), max(1, int(math.ceil(rect.height() / block)))
+    img = QImage(w, h, QImage.Format_ARGB32_Premultiplied)
+    img.fill(0)
+    p = QPainter(img)
+    p.scale(1.0 / block, 1.0 / block)
+    p.translate(-rect.left(), -rect.top())
+    p.fillPath(path, color)
+    p.end()
+    a = np.frombuffer(img.constBits(), np.uint8).reshape(h, img.bytesPerLine() // 4, 4)[:, :w, :].copy()
+    m = a[..., 3] > 110                                   # hard edge: no anti-aliasing, so the pixels stay square
+    a[...] = 0
+    a[m] = (color.blue(), color.green(), color.red(), 255)
+    q = QImage(a.data, w, h, w * 4, QImage.Format_ARGB32).copy()
+    return q, rect, block
+
+
+class FxState:
+    """Everything the effect painter needs (a text layer or a preview thumbnail fills one in)."""
+    def __init__(self, fx="none", color="#000000", fxc="#7b5cff", amt=50, ang=45, fs=40.0):
+        self.fx, self.color, self.fxc, self.amt, self.ang, self.fs = fx, QColor(color), QColor(fxc), amt, ang, fs
+
+
+def fx_margin(st):
+    """How far an effect paints outside the letters (so the layer's box can include it)."""
+    k = max(st.amt, 1) / 50.0
+    return {"none": 0, "drop": 0.12, "glow": 0.4, "echo": 0.25, "outline": 0.09, "background": 0.3, "splice": 0.12,
+            "hollow": 0.04, "neon": 0.45, "glitch": 0.1, "extrude": 0.3, "retro": 0.3, "graffiti": 0.2, "bubble": 0.22,
+            "pixel": 0.15}.get(st.fx, 0) * st.fs * max(k, 0.6)
+
+
+def paint_fx(p, path, st, cache=None, scale=1.0, outline=None):
+    """Draw `path` (text outlines) with the chosen effect. `outline` = (width, QColor) of the plain text outline."""
+    fx, T, E, fs = st.fx, st.color, st.fxc, st.fs
+    k = max(st.amt, 1) / 50.0
+    ang = math.radians(st.ang)
+    dx, dy = math.cos(ang), math.sin(ang)
+    p.setRenderHint(QPainter.Antialiasing)
+
+    def fill(pth, col, ox=0.0, oy=0.0):
+        p.save()
+        p.translate(ox, oy)
+        p.fillPath(pth, col)
+        p.restore()
+
+    def stroke(pth, col, w, ox=0.0, oy=0.0):
+        p.save()
+        p.translate(ox, oy)
+        p.strokePath(pth, QPen(col, max(w, 0.5), Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        p.restore()
+
+    def soft(col, radius, ox=0.0, oy=0.0, times=1):
+        key = ("soft", fx, round(radius, 1), col.rgba(), round(scale, 1))
+        hit = cache.get(key) if cache is not None else None
+        if np is None:
+            fill(path, faded(col, 0.5), ox, oy)
+            return
+        if hit is None:
+            hit = soft_copy(path, col, radius, scale)
+            if cache is not None:
+                if len(cache) > 12:
+                    cache.clear()
+                cache[key] = hit
+        img, rect = hit
+        for _ in range(times):
+            p.drawImage(rect.translated(ox, oy), img)
+
+    def faded(col, a):
+        c = QColor(col)
+        c.setAlpha(int(max(0, min(255, c.alpha() * a))))
+        return c
+
+    base = True
+    if fx == "drop":
+        d = fs * 0.06 * k
+        soft(faded(E, 0.85), fs * 0.035 * k, dx * d, dy * d)
+    elif fx == "glow":
+        soft(E, fs * 0.26 * k, times=3)
+    elif fx == "echo":
+        d = fs * 0.07 * k
+        for i in (3, 2, 1):
+            fill(path, faded(E, 0.75 - 0.18 * i), dx * d * i, dy * d * i)
+    elif fx == "outline":
+        stroke(path, E, fs * 0.075 * k)
+    elif fx == "background":
+        r = path.boundingRect()
+        pad = fs * 0.22
+        p.setPen(Qt.NoPen)
+        p.setBrush(E)
+        p.drawRoundedRect(r.adjusted(-pad, -pad * 0.7, pad, pad * 0.7), fs * 0.18, fs * 0.18)
+    elif fx == "splice":
+        d = fs * 0.07 * k
+        stroke(path, E, max(fs * 0.025, 1.2), dx * d, dy * d)
+    elif fx == "hollow":
+        stroke(path, T, fs * 0.04 * k)
+        base = False
+    elif fx == "neon":
+        soft(E, fs * 0.26 * k, times=3)
+        stroke(path, E, fs * 0.035)
+        core = QColor(T)
+        core.setRed((core.red() + 255 * 7) // 8)
+        core.setGreen((core.green() + 255 * 7) // 8)
+        core.setBlue((core.blue() + 255 * 7) // 8)
+        fill(path, core)
+        base = False
+    elif fx == "glitch":
+        d = fs * 0.045 * k
+        fill(path, faded(QColor.fromHsv((E.hue() + 180) % 360 if E.hue() >= 0 else 180, max(E.saturation(), 160), 255), 0.85), -d, -d * 0.4)
+        fill(path, faded(E, 0.85), d, d * 0.4)
+    elif fx in ("extrude", "retro"):
+        n = int(6 + 8 * k)
+        step = fs * 0.014
+        for i in range(n, 0, -1):
+            col = E if fx == "extrude" or i % 6 < 3 else E.lighter(160)
+            if fx == "retro" and i <= 3:
+                col = QColor("#ff6a3d")
+            fill(path, col, dx * i * step, dy * i * step)
+    elif fx == "graffiti":
+        fill(path, QColor(0, 0, 0, 200), fs * 0.05 * k, fs * 0.05 * k)
+        stroke(path, E, fs * 0.13 * k)
+    elif fx == "bubble":
+        stroke(path, E.darker(260), fs * 0.2 * k)
+        stroke(path, E, fs * 0.13 * k)
+        stroke(path, E.lighter(150), fs * 0.03 * k)
+    elif fx == "pixel" and np is None:
+        fill(path, E, fs * 0.04, fs * 0.04)
+        base = True
+    elif fx == "pixel":
+        blk = max(2.0, fs * 0.075 * k)
+        for col, ox, oy in ((E, blk * 0.6, blk * 0.6), (T, 0, 0)):
+            key = ("pix", round(blk, 1), col.rgba())
+            hit = cache.get(key) if cache is not None else None
+            if hit is None:
+                hit = pixel_copy(path, col, blk)
+                if cache is not None:
+                    if len(cache) > 12:
+                        cache.clear()
+                    cache[key] = hit
+            img, rect, b = hit
+            p.save()
+            p.setRenderHint(QPainter.SmoothPixmapTransform, False)
+            p.drawImage(QRectF(rect.left() + ox, rect.top() + oy, img.width() * b, img.height() * b), img)
+            p.restore()
+        base = False
+    if base:
+        p.fillPath(path, T)
+    if outline and outline[0] > 0:
+        p.strokePath(path, QPen(outline[1], outline[0], Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+
+
+def curve_glyphs(glyphs, cx, baseline, curve, length):
+    """Bend one line of text on a circle WITHOUT distorting the letters: every glyph keeps its exact shape and size and is
+    only moved along the circle and turned to follow it. glyphs = [(QPainterPath at its layout position, centre x)].
+    curve -100..100: positive = arch, negative = bowl, +-100 = full circle."""
+    th = abs(curve) / 100.0 * 2 * math.pi
+    out = QPainterPath()
+    if th < 1e-4 or length < 1:
+        for gp, _ in glyphs:
+            out.addPath(gp)
+        return out
+    r = length / th
+    up = curve > 0
+    for gp, gc in glyphs:
+        phi = (gc - cx) / r
+        if up:
+            px, py, rot = cx + r * math.sin(phi), baseline + r - r * math.cos(phi), math.degrees(phi)
+        else:
+            px, py, rot = cx + r * math.sin(phi), baseline - r + r * math.cos(phi), -math.degrees(phi)
+        t = QTransform()
+        t.translate(px, py)
+        t.rotate(rot)
+        t.translate(-gc, -baseline)
+        out.addPath(t.map(gp))
+    return out
+
+
+def sample_path(text, family, bold, size=44, w=84, h=84, bend=0):
+    """Outline path of a short sample text centred in a w x h tile (used by the thumbnails)."""
+    f = QFont(family)
+    f.setPixelSize(size)
+    f.setBold(bold)
+    fm = QFontMetricsF(f)
+    glyphs, x = [], 0.0
+    for ch in text:
+        gp = QPainterPath()
+        gp.addText(x, 0, f, ch)
+        adv = fm.horizontalAdvance(ch)
+        glyphs.append((gp, x + adv / 2))
+        x += adv
+    if bend:
+        pth = curve_glyphs(glyphs, x / 2, 0.0, bend, x)
+    else:
+        pth = QPainterPath()
+        for gp, _ in glyphs:
+            pth.addPath(gp)
+    r = pth.boundingRect()
+    pth.translate(w / 2 - r.center().x(), h / 2 - r.center().y())
+    return pth
+
+
+def fx_thumb(st, text="Ag", family=None, bold=True, bend=0, size=84, bg="#ffffff", ratio=0.48):
+    """A small picture of an effect / style for the tiles in the Text panel."""
+    dpr = 2
+    pm = QPixmap(size * dpr, size * dpr)
+    pm.setDevicePixelRatio(dpr)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setPen(Qt.NoPen)
+    p.setBrush(QColor(bg))
+    p.drawRoundedRect(QRectF(0, 0, size, size), 9, 9)
+    fam = family or QFont().family()
+    st.fs = size * ratio
+    path = sample_path(text, fam, bold, int(size * ratio), size, size, bend)
+    paint_fx(p, path, st, None, dpr)
+    p.end()
+    return pm
+
+
 class TextItem(QGraphicsTextItem):
     """Text layer. Not editable until double-clicked (so it can be selected / dragged normally)."""
     def __init__(self, text=""):
@@ -206,6 +493,11 @@ class TextItem(QGraphicsTextItem):
         self.align, self.box_w = "left", 0          # box_w 0 = auto width, >0 = manual wrap width
         self.line_h, self.indent = 100, 0            # line spacing in percent, indent level (0..10)
         self.outline_w, self.outline = 0, QColor("#000000")   # text outline width (px) + colour
+        self.fx, self.fx_color, self.fx_amt, self.fx_ang = "none", QColor("#7b5cff"), 50, 45   # effect, its colour / strength / direction
+        self.curve = 0                                # -100..100: text bent on a circle (100 = full circle)
+        self.fx_on, self.curve_on, self.adv = True, True, None   # switches: effect / curve / Advanced style (settings are kept while off)
+        self._pkey = self._pdata = self._fxcache = None
+        self._ext = None
         self.setTextInteractionFlags(Qt.NoTextInteraction)
         self._fitting = False
         self.document().contentsChanged.connect(self.fit_width)
@@ -214,8 +506,91 @@ class TextItem(QGraphicsTextItem):
 
     def boundingRect(self):
         """Tight line spacing shrinks Qt's line boxes, so glyphs poke out below the text box and were clipped.
-        Extend the box by that overhang so nothing is cut."""
-        return super().boundingRect().adjusted(0, 0, 0, self.pad_bottom)
+        Extend the box by that overhang so nothing is cut. A curved text / an effect makes the box bigger too."""
+        r = super().boundingRect().adjusted(0, 0, 0, self.pad_bottom)
+        return r.united(self._ext) if self._ext is not None else r
+
+    def curve_eff(self):
+        return self.curve if self.curve_on else 0
+
+    def fx_eff(self):
+        return self.fx if self.fx_on else "none"
+
+    def fx_active(self):
+        return self.fx_eff() != "none" or bool(self.curve_eff())
+
+    def fx_state(self):
+        st = FxState(self.fx_eff(), self.defaultTextColor().name(QColor.HexArgb), self.fx_color.name(QColor.HexArgb), self.fx_amt, self.fx_ang)
+        st.fs = self._pdata[1] if self._pdata else 40.0
+        return st
+
+    def text_path(self):
+        """Outlines of all the letters exactly where the document layout put them (curved when asked). -> (path, font size)."""
+        doc = self.document()
+        curve = self.curve_eff()
+        key = (self.toPlainText(), self.font().toString(), round(self.textWidth(), 1), self.line_h, self.align, self.indent,
+               curve, doc.documentMargin())
+        if key == self._pkey and self._pdata:
+            return self._pdata
+        self._fxcache = None                                  # cached glows / pixel copies belong to the old outlines
+        lay = doc.documentLayout()
+        total, fs = QPainterPath(), 0.0
+        blk = doc.begin()
+        while blk.isValid():
+            tl = blk.layout()
+            org = lay.blockBoundingRect(blk).topLeft()
+            for i in range(tl.lineCount()):
+                ln = tl.lineAt(i)
+                glyphs, x0, x1 = [], 1e9, -1e9
+                for run in ln.glyphRuns():
+                    raw = run.rawFont()
+                    fs = fs or raw.pixelSize()
+                    idx = run.glyphIndexes()
+                    for g, ps, adv in zip(idx, run.positions(), raw.advancesForGlyphIndexes(idx)):
+                        gp = raw.pathForGlyph(g)
+                        gp.translate(ps + org)
+                        gx = ps.x() + org.x()
+                        x0, x1 = min(x0, gx), max(x1, gx + adv.x())
+                        glyphs.append((gp, gx + adv.x() / 2))
+                if not glyphs:
+                    continue
+                if curve:
+                    base = ln.position().y() + ln.ascent() + org.y()
+                    total.addPath(curve_glyphs(glyphs, (x0 + x1) / 2, base, curve, x1 - x0))
+                else:
+                    for gp, _ in glyphs:
+                        total.addPath(gp)
+            blk = blk.next()
+        self._pkey, self._pdata = key, (total, fs or 40.0)
+        return self._pdata
+
+    def update_extent(self):
+        """Box that also holds the bent / decorated letters (called whenever the layout changes)."""
+        ext = None
+        if self.fx_active():
+            path, fs = self.text_path()
+            if not path.isEmpty():
+                st = self.fx_state()
+                st.fs = fs
+                m = fx_margin(st) + math.ceil(self.outline_w / 2) + 2
+                base = super().boundingRect().adjusted(0, 0, 0, self.pad_bottom)
+                ext = path.boundingRect().united(base).adjusted(-m, -m, m, m)
+        if ext != self._ext:
+            self.prepareGeometryChange()
+            self._ext = ext
+
+    def paint(self, p, opt, widget=None):
+        if not self.fx_active() or self.textInteractionFlags() != Qt.NoTextInteraction:
+            return super().paint(p, opt, widget)                # plain text, and while typing
+        path, fs = self.text_path()
+        if path.isEmpty():
+            return super().paint(p, opt, widget)
+        if self._fxcache is None:
+            self._fxcache = {}
+        st = self.fx_state()
+        st.fs = fs
+        sc = math.hypot(p.deviceTransform().m11(), p.deviceTransform().m12()) if p.device() else 1.0
+        paint_fx(p, path, st, self._fxcache, sc, (self.outline_w, self.outline) if self.outline_w > 0 else None)
 
     def fit_width(self):
         """Auto width: size the box to the widest line. Without a text width Qt ignores alignment entirely."""
@@ -247,13 +622,15 @@ class TextItem(QGraphicsTextItem):
         cur.mergeBlockFormat(bf)
         cf = QTextCharFormat()
         cf.setTextOutline(QPen(self.outline, self.outline_w, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
-                          if self.outline_w > 0 else QPen(Qt.NoPen))
+                          if (self.outline_w > 0 and not self.fx_active()) else QPen(Qt.NoPen))
         cur.mergeCharFormat(cf)
         cur.endEditBlock()
         if self.box_w > 0:
             self.setTextWidth(self.box_w)
         else:
             self.fit_width()
+        self._pkey = None
+        self.update_extent()
         self.sync_origin()
 
     def sync_origin(self):
@@ -510,6 +887,269 @@ class ShapeItem(QGraphicsItem):
         sc = self.scene()
         if sc and sc.on_shape_edit and not self.data(1):
             sc.on_shape_edit()
+
+
+# ---------------------------------------------------------------- arrow brushes
+ARROW_STYLES = [("Classic", "classic"), ("Solid head", "solid"), ("Sketch", "sketch"), ("Brush", "brush"),
+                ("Dashed", "dashed"), ("Dotted", "dotted"), ("Double", "double"), ("Block", "block"),
+                ("Outline", "outline"), ("Chalk", "chalk"), ("Wavy", "wavy"), ("Dot start", "dot")]
+
+
+def smooth_polyline(pts, per=10):
+    """Points drawn with the mouse -> a smooth curve through them (Catmull-Rom), as a list of QPointF."""
+    if len(pts) < 3:
+        return [QPointF(q) for q in pts]
+    P = [pts[0]] + list(pts) + [pts[-1]]
+    out = [QPointF(pts[0])]
+    for i in range(1, len(P) - 2):
+        p0, p1, p2, p3 = P[i - 1], P[i], P[i + 1], P[i + 2]
+        for k in range(1, per + 1):
+            t = k / per
+            t2, t3 = t * t, t * t * t
+            out.append(QPointF(*[0.5 * ((2 * a1) + (-a0 + a2) * t + (2 * a0 - 5 * a1 + 4 * a2 - a3) * t2 + (-a0 + 3 * a1 - 3 * a2 + a3) * t3)
+                                 for a0, a1, a2, a3 in ((p0.x(), p1.x(), p2.x(), p3.x()), (p0.y(), p1.y(), p2.y(), p3.y()))]))
+    return out
+
+
+def simplify_points(pts, eps):
+    """Ramer-Douglas-Peucker: drop mouse points that lie (almost) on a straight run."""
+    if len(pts) < 3:
+        return list(pts)
+    a, b = pts[0], pts[-1]
+    dx, dy = b.x() - a.x(), b.y() - a.y()
+    n = math.hypot(dx, dy)
+    best, bi = 0.0, 0
+    for i in range(1, len(pts) - 1):
+        q = pts[i]
+        d = abs(dy * (q.x() - a.x()) - dx * (q.y() - a.y())) / n if n > 1e-9 else math.hypot(q.x() - a.x(), q.y() - a.y())
+        if d > best:
+            best, bi = d, i
+    if best <= eps:
+        return [a, b]
+    return simplify_points(pts[:bi + 1], eps)[:-1] + simplify_points(pts[bi:], eps)
+
+
+def poly_length(poly):
+    return sum(math.hypot(poly[i + 1].x() - poly[i].x(), poly[i + 1].y() - poly[i].y()) for i in range(len(poly) - 1))
+
+
+def poly_trim_end(poly, d):
+    """The polyline without its last `d` units, plus the unit direction the end was heading."""
+    poly = list(poly)
+    tip = poly[-1]
+    left = d
+    while len(poly) > 2:
+        seg = math.hypot(poly[-1].x() - poly[-2].x(), poly[-1].y() - poly[-2].y())
+        if seg > left:
+            break
+        left -= seg
+        poly.pop()
+    a, b = poly[-2], poly[-1]
+    seg = math.hypot(b.x() - a.x(), b.y() - a.y()) or 1.0
+    ux, uy = (b.x() - a.x()) / seg, (b.y() - a.y()) / seg
+    k = min(left, seg * 0.98)
+    poly[-1] = QPointF(b.x() - ux * k, b.y() - uy * k)
+    q = poly[-1]
+    dirn = (tip.x() - q.x(), tip.y() - q.y())
+    nrm = math.hypot(*dirn) or 1.0
+    return poly, (dirn[0] / nrm, dirn[1] / nrm)
+
+
+def poly_resample(poly, step):
+    """Points every `step` units along the polyline (so a straight stroke can be wobbled too)."""
+    out = [QPointF(poly[0])]
+    carry = 0.0
+    for a, b in zip(poly, poly[1:]):
+        seg = math.hypot(b.x() - a.x(), b.y() - a.y())
+        pos = step - carry
+        while pos < seg:
+            t = pos / seg
+            out.append(QPointF(a.x() + (b.x() - a.x()) * t, a.y() + (b.y() - a.y()) * t))
+            pos += step
+        carry = seg - (pos - step)
+    out.append(QPointF(poly[-1]))
+    return out
+
+
+def poly_ribbon(poly, widths):
+    """Closed outline of a stroke whose width changes along the polyline."""
+    left, right = [], []
+    n = len(poly)
+    for i, q in enumerate(poly):
+        a, b = poly[max(i - 1, 0)], poly[min(i + 1, n - 1)]
+        dx, dy = b.x() - a.x(), b.y() - a.y()
+        m = math.hypot(dx, dy) or 1.0
+        nx, ny = -dy / m, dx / m
+        w = widths[i] / 2
+        left.append(QPointF(q.x() + nx * w, q.y() + ny * w))
+        right.append(QPointF(q.x() - nx * w, q.y() - ny * w))
+    return QPolygonF(left + right[::-1])
+
+
+class ArrowItem(ShapeItem):
+    """Arrow brush stroke: a smooth path with an arrow head. Colour = fill colour, so the normal colour buttons work."""
+    def __init__(self, pts, style="classic", color="#ff4d6d", width=10, head=100):
+        super().__init__("arrow", 10, 10, color, color, 0)
+        self.pts = [QPointF(q) for q in pts]
+        self.style, self.lw, self.head = style, float(width), float(head)
+        self._br, self.poly = QRectF(0, 0, 10, 10), []
+        self.recalc()
+
+    def head_len(self):
+        return max(self.lw * 3.4, 24.0) * self.head / 100.0
+
+    def recalc(self):
+        self.prepareGeometryChange()
+        self.poly = smooth_polyline(self.pts) if len(self.pts) > 1 else list(self.pts)
+        if not self.poly:
+            self.poly = [QPointF(0, 0), QPointF(1, 1)]
+        xs, ys = [q.x() for q in self.poly], [q.y() for q in self.poly]
+        m = max(self.lw * 1.3, self.head_len() * 0.65) + 4
+        self._br = QRectF(min(xs) - m, min(ys) - m, max(xs) - min(xs) + 2 * m, max(ys) - min(ys) + 2 * m)
+        self.w, self.h = self._br.width(), self._br.height()
+
+    def boundingRect(self):
+        return QRectF(self._br)
+
+    def shape(self):
+        st = QPainterPathStroker()
+        st.setWidth(max(self.lw * 1.6, 34.0))
+        path = QPainterPath()
+        path.addPolygon(QPolygonF(self.poly))
+        out = st.createStroke(path)
+        hl = self.head_len()
+        for q in (self.poly[-1], self.poly[0] if self.style == "double" else None):
+            if q is not None:
+                out.addEllipse(q, hl * 0.7, hl * 0.7)
+        return out
+
+    def paint(self, p, opt, widget=None):
+        p.setRenderHint(QPainter.Antialiasing)
+        col, lw, hl = QColor(self.fill), self.lw, self.head_len()
+        poly = self.poly
+        if len(poly) < 2:
+            return
+        st = self.style
+        ang = math.radians(26)
+
+        def vhead(tip, d, pen_w, rot=0.0):
+            ca, sa = math.cos(ang + rot), math.sin(ang + rot)
+            cb, sb = math.cos(-ang + rot), math.sin(-ang + rot)
+            a = QPointF(tip.x() - hl * (d[0] * ca - d[1] * sa), tip.y() - hl * (d[0] * sa + d[1] * ca))
+            b = QPointF(tip.x() - hl * (d[0] * cb - d[1] * sb), tip.y() - hl * (d[0] * sb + d[1] * cb))
+            pen = QPen(col, pen_w, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+            p.setPen(pen)
+            p.setBrush(Qt.NoBrush)
+            p.drawPolyline(QPolygonF([a, tip, b]))
+
+        def thead(tip, d, scale=1.0, outline=False):
+            base = QPointF(tip.x() - d[0] * hl * scale, tip.y() - d[1] * hl * scale)
+            half = hl * scale * math.tan(ang) * 0.95
+            nx, ny = -d[1], d[0]
+            tri = QPolygonF([tip, QPointF(base.x() + nx * half, base.y() + ny * half), QPointF(base.x() - nx * half, base.y() - ny * half)])
+            if outline:
+                p.setPen(QPen(col, max(lw * 0.6, 2), Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+                p.setBrush(Qt.NoBrush)
+            else:
+                p.setPen(QPen(col, 1))
+                p.setBrush(col)
+            p.drawPolygon(tri)
+
+        def line(poly_, pen_w, pen=None):
+            p.setPen(pen or QPen(col, pen_w, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            p.setBrush(Qt.NoBrush)
+            p.drawPolyline(QPolygonF(poly_))
+
+        tip = poly[-1]
+        if st in ("classic", "dashed", "dotted", "dot", "wavy"):
+            shaft, d = poly_trim_end(poly, hl * 0.12)
+            if st == "dashed":
+                pen = QPen(col, lw, Qt.CustomDashLine, Qt.FlatCap, Qt.RoundJoin)
+                pen.setDashPattern([2.4, 1.6])
+                line(shaft, lw, pen)
+            elif st == "dotted":
+                pen = QPen(col, lw * 1.1, Qt.CustomDashLine, Qt.RoundCap, Qt.RoundJoin)
+                pen.setDashPattern([0.01, 2.2])
+                line(shaft, lw, pen)
+            elif st == "wavy":
+                amp, wl = max(lw * 0.9, 3), max(lw * 7, 40)
+                out, run = [], 0.0
+                for i, q in enumerate(shaft):
+                    if i:
+                        run += math.hypot(q.x() - shaft[i - 1].x(), q.y() - shaft[i - 1].y())
+                    a, b = shaft[max(i - 1, 0)], shaft[min(i + 1, len(shaft) - 1)]
+                    m = math.hypot(b.x() - a.x(), b.y() - a.y()) or 1.0
+                    o = amp * math.sin(run / wl * 2 * math.pi) * min(1.0, run / wl)
+                    out.append(QPointF(q.x() - (b.y() - a.y()) / m * o, q.y() + (b.x() - a.x()) / m * o))
+                line(out, lw)
+            else:
+                line(shaft, lw)
+                if st == "dot":
+                    p.setPen(Qt.NoPen)
+                    p.setBrush(col)
+                    p.drawEllipse(poly[0], lw * 1.1, lw * 1.1)
+            vhead(tip, d, lw)
+        elif st == "solid":
+            shaft, d = poly_trim_end(poly, hl * 0.85)
+            line(shaft, lw)
+            thead(tip, d)
+        elif st == "double":
+            shaft, d = poly_trim_end(poly, hl * 0.85)
+            rev, d0 = poly_trim_end(shaft[::-1], hl * 0.85)
+            line(rev, lw)
+            thead(tip, d)
+            thead(poly[0], d0)
+        elif st == "brush":
+            shaft, d = poly_trim_end(poly, hl * 0.8)
+            n = len(shaft)
+            ws = [lw * (0.25 + 1.35 * (i / max(n - 1, 1)) ** 1.1) for i in range(n)]
+            p.setPen(QPen(col, 1))
+            p.setBrush(col)
+            p.drawPolygon(poly_ribbon(shaft, ws))
+            thead(tip, d, 1.05)
+        elif st in ("block", "outline"):
+            shaft, d = poly_trim_end(poly, hl * 1.0)
+            ws = [lw * 2.4] * len(shaft)
+            body = QPainterPath()
+            body.addPolygon(poly_ribbon(shaft, ws))
+            body.closeSubpath()
+            base = QPointF(tip.x() - d[0] * hl, tip.y() - d[1] * hl)
+            half = hl * 0.62
+            nx, ny = -d[1], d[0]
+            head = QPainterPath()
+            head.addPolygon(QPolygonF([tip, QPointF(base.x() + nx * half, base.y() + ny * half), QPointF(base.x() - nx * half, base.y() - ny * half)]))
+            head.closeSubpath()
+            allp = body.united(head)
+            if st == "block":
+                p.setPen(QPen(col, 1.2))
+                p.setBrush(col)
+            else:
+                p.setPen(QPen(col, max(lw * 0.55, 2.5), Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+                p.setBrush(Qt.NoBrush)
+            p.drawPath(allp)
+        elif st in ("sketch", "chalk"):
+            rnd = random.Random(7)
+            shaft, d = poly_trim_end(poly, hl * 0.12)
+            passes = 2 if st == "sketch" else 3
+            for k in range(passes):
+                amp = lw * (0.45 if st == "sketch" else 0.7)
+                jit = [QPointF(q.x() + rnd.uniform(-amp, amp), q.y() + rnd.uniform(-amp, amp))
+                       for q in poly_resample(shaft, max(lw * 2.5, 14.0))]
+                jit = smooth_polyline(jit, 4)
+                c2 = QColor(col)
+                if st == "chalk":
+                    c2.setAlpha(int(col.alpha() * 0.6))
+                p.setPen(QPen(c2, lw * (0.65 if st == "sketch" else 0.5), Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+                p.setBrush(Qt.NoBrush)
+                p.drawPolyline(QPolygonF(jit))
+                vhead(tip, d, lw * (0.65 if st == "sketch" else 0.5), rnd.uniform(-0.12, 0.12))
+        else:
+            line(poly, lw)
+
+    def mouseDoubleClickEvent(self, e):
+        sc = self.scene()
+        if sc and getattr(sc, "on_arrow_edit", None) and not self.data(1):
+            sc.on_arrow_edit()
 
 
 def frame_pixmap(img, crop, adj, maxdim=None):
@@ -1017,6 +1657,9 @@ class Canvas(QGraphicsScene):
         self.on_transform = None
         self.on_error = None
         self.on_shape_edit = None
+        self.on_arrow_edit = None
+        self.brush = None                        # drawing arrows: dict (style, color, ...) while the Brushes tool is on
+        self.brush_pts, self.brush_prev, self.on_brush_done = None, None, None
         self.crop_overlay = None
         self.exporting = False
         self.gdrag = None                        # photo being carried from one grid cell to another
@@ -1224,7 +1867,59 @@ class Canvas(QGraphicsScene):
                 self.snap_lines.append(("h", ty))
         self.update()
 
+    def brush_event(self, e, phase):
+        """Arrow brush: press-drag-release draws one arrow (free hand, or a straight line). True = event used."""
+        if self.brush is None or self.exporting:
+            return False
+        if phase == "press":
+            if e.button() != Qt.LeftButton:
+                return False
+            self.brush_pts = [QPointF(e.scenePos())]
+            prev = ArrowItem([e.scenePos(), e.scenePos() + QPointF(1, 1)], self.brush["style"], self.brush["color"],
+                             self.brush["width"], self.brush["head"])
+            prev.setZValue(1e9)
+            prev.setAcceptedMouseButtons(Qt.NoButton)
+            prev.setOpacity(0.9)
+            self.addItem(prev)
+            self.brush_prev = prev
+            self.clearSelection()
+            e.accept()
+            return True
+        if self.brush_pts is None:
+            return False
+        q = QPointF(e.scenePos())
+        if phase == "move":
+            if self.brush["straight"] or e.modifiers() & Qt.ShiftModifier:
+                self.brush_pts = [self.brush_pts[0], q]
+            elif math.hypot(q.x() - self.brush_pts[-1].x(), q.y() - self.brush_pts[-1].y()) > 3 * self.px():
+                self.brush_pts.append(q)
+            else:
+                return True
+            if len(self.brush_pts) >= 2:
+                self.brush_prev.pts = list(self.brush_pts)
+                self.brush_prev.recalc()
+            self.update()
+            e.accept()
+            return True
+        if phase == "release":                       # done
+            pts, self.brush_pts = self.brush_pts, None
+            if self.brush_prev is not None:
+                self.removeItem(self.brush_prev)
+                self.brush_prev = None
+            straight = self.brush["straight"] or bool(e.modifiers() & Qt.ShiftModifier)
+            if len(pts) >= 2 and poly_length(pts) > 8 * self.px() and self.on_brush_done:
+                if straight:
+                    pts = [pts[0], pts[-1]]
+                else:
+                    pts = simplify_points(pts, 2.5 * self.px())
+                self.on_brush_done(pts)
+            e.accept()
+            return True
+        return False
+
     def mousePressEvent(self, e):
+        if self.brush_event(e, "press"):
+            return
         if e.button() == Qt.LeftButton:
             kind = self.hit(e.scenePos())
             if kind:
@@ -1260,6 +1955,8 @@ class Canvas(QGraphicsScene):
             self.update()
 
     def mouseMoveEvent(self, e):
+        if self.brush_event(e, "move"):
+            return
         d = self.drag
         gd = self.gdrag
         if gd and (e.buttons() & Qt.LeftButton):
@@ -1331,6 +2028,8 @@ class Canvas(QGraphicsScene):
             self.on_transform()
 
     def mouseReleaseEvent(self, e):
+        if self.brush_event(e, "release"):
+            return
         gd, self.gdrag = self.gdrag, None
         self.gtimer.stop()
         if gd and gd["active"]:
@@ -3281,9 +3980,14 @@ class TextPanel(QDialog):
         super().__init__(m)
         self.m, self.busy = m, False
         self.setWindowTitle("Text / Font")
-        self.setFixedWidth(340)
-        self.resize(340, 460)
-        lay = QVBoxLayout(self)
+        self.setFixedWidth(400)
+        self.resize(400, 640)
+        top = QVBoxLayout(self)
+        self.tabs = QTabWidget()
+        top.addWidget(self.tabs)
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        self.tabs.addTab(page, "Font")
         for label, fn in (("Font...", m.pick_font), ("Text Color...", m.pick_text_color)):
             b = QPushButton(label)
             b.clicked.connect(lambda checked=False, f=fn: f())
@@ -3305,7 +4009,259 @@ class TextPanel(QDialog):
         lay.addWidget(self.ocolor)
         self.outline = self.slider_row(lay, "Outline width (px)", 0, 40, "outline_w")
         lay.addStretch()
+        self.build_effects_tab()
+        self.build_shape_tab()
+        self.build_style_tab()
         m.scene.selectionChanged.connect(self.refresh)
+        self.refresh()
+
+    # ---------- Effects / Shape / Advanced tabs
+    def tile_grid(self, items, cols, on_click, size=78):
+        """Grid of picture tiles (one is highlighted). items = [(label, QPixmap, key)] -> (widget, {key: button})."""
+        w = QWidget()
+        g = QGridLayout(w)
+        g.setSpacing(8)
+        g.setAlignment(Qt.AlignTop)
+        grp = QButtonGroup(w)
+        grp.setExclusive(True)
+        btns = {}
+        for n, (label, pm, key) in enumerate(items):
+            b = QToolButton()
+            b.setCheckable(True)
+            b.setAutoExclusive(False)
+            b.setIcon(QIcon(pm))
+            b.setIconSize(QSize(size, size))
+            b.setText(label)
+            b.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+            b.setFixedSize(size + 24, size + 34)
+            b.setStyleSheet("QToolButton { background: #ffffff; border: 1px solid #d5d5dd; border-radius: 10px; color: #333; "
+                            "font-size: 11px; padding: 4px; } QToolButton:hover { border-color: #9b83ff; } "
+                            "QToolButton:checked { border: 2px solid #7b5cff; }")
+            b.clicked.connect(lambda checked=False, k=key: on_click(k))
+            g.addWidget(b, n // cols, n % cols, Qt.AlignHCenter)
+            btns[key] = b
+        return w, btns
+
+    def sample_state(self, fx, **kw):
+        return FxState(fx, kw.get("color", "#6a3df0"), kw.get("fxc", "#b9a2ff"), kw.get("amt", 55), 45)
+
+    def build_effects_tab(self):
+        page = QWidget()
+        v = QVBoxLayout(page)
+        self.fx_chk = QCheckBox("Effect on")
+        self.fx_chk.setToolTip("Untick to see the plain text. Your settings are kept; tick again to bring the effect back.")
+        self.fx_chk.toggled.connect(self.toggle_fx)
+        v.addWidget(self.fx_chk)
+        items = [(name, fx_thumb(self.sample_state(key, color="#7b3ff2", fxc="#c3adff" if key not in ("glow", "neon", "background") else "#a98bff"),
+                                 bold=True), key) for name, key in TEXT_EFFECTS]
+        w, self.fx_btns = self.tile_grid(items, 3, self.set_effect)
+        v.addWidget(w)
+        self.fx_box = QWidget()
+        fb = QVBoxLayout(self.fx_box)
+        fb.setContentsMargins(0, 0, 0, 0)
+        v.addWidget(self.fx_box)
+        v = fb
+        self.fxcol = QPushButton("Effect Color...")
+        self.fxcol.clicked.connect(self.pick_fx_color)
+        v.addWidget(self.fxcol)
+        self.fx_amt = self.slider_row(v, "Intensity", 1, 100, "fx_amt")
+        self.fx_ang = self.slider_row(v, "Direction (degrees)", 0, 360, "fx_ang")
+        v.addStretch()
+        self.tabs.addTab(page, "Effects")
+
+    def build_shape_tab(self):
+        page = QWidget()
+        v = QVBoxLayout(page)
+        self.cv_chk = QCheckBox("Curve on")
+        self.cv_chk.setToolTip("Untick to straighten the text. Your curve is kept; tick again to bring it back.")
+        self.cv_chk.toggled.connect(self.toggle_curve)
+        v.addWidget(self.cv_chk)
+        none = fx_thumb(FxState("none", "#7b3ff2"), "ABCD", bold=True, size=84, ratio=0.26)
+        curved = fx_thumb(FxState("none", "#7b3ff2"), "ABCD", bold=True, bend=55, size=84, ratio=0.26)
+        w, self.shape_btns = self.tile_grid([("None", none, "none"), ("Curve", curved, "curve")], 3, self.set_shape)
+        v.addWidget(w)
+        self.cv_box = QWidget()
+        cb = QVBoxLayout(self.cv_box)
+        cb.setContentsMargins(0, 0, 0, 0)
+        v.addWidget(self.cv_box)
+        cb.addWidget(QLabel("Curve  (positive: arch, negative: bowl, 100 = full circle)"))
+        row = QHBoxLayout()
+        self.curve_s = QSlider(Qt.Horizontal)
+        self.curve_s.setRange(-100, 100)
+        self.curve_sp = QSpinBox()
+        self.curve_sp.setRange(-100, 100)
+        self.curve_sp.setKeyboardTracking(False)
+
+        def moved(val):
+            self.curve_sp.blockSignals(True)
+            self.curve_sp.setValue(val)
+            self.curve_sp.blockSignals(False)
+            self.put("curve", val, not self.curve_s.isSliderDown())
+            self.mark_shape()
+        self.curve_s.valueChanged.connect(moved)
+        self.curve_s.sliderReleased.connect(self.m.commit)
+        self.curve_sp.valueChanged.connect(self.curve_s.setValue)
+        row.addWidget(self.curve_s, 1)
+        row.addWidget(self.curve_sp)
+        cb.addLayout(row)
+        v.addStretch()
+        self.tabs.addTab(page, "Shape")
+
+    def style_font(self, fams):
+        have = set(QFontDatabase.families())
+        for f in fams:
+            if f in have:
+                return f
+        return None
+
+    def build_style_tab(self):
+        page = QWidget()
+        v = QVBoxLayout(page)
+        self.adv_chk = QCheckBox("Style on")
+        self.adv_chk.setToolTip("Untick to go back to your text as it was before the style. The style is kept; tick again to bring it back.")
+        self.adv_chk.toggled.connect(self.toggle_adv)
+        v.addWidget(self.adv_chk)
+        items = []
+        for name, fams, bold, fx, col, fxc, amt in TEXT_STYLES:
+            st = FxState(fx, col, fxc, amt, 45)              # every style is previewed the same way: "Ag" on one dark tile
+            items.append((name, fx_thumb(st, "Ag", self.style_font(fams), bold, 0, 78, "#241b3d"), name))
+        w, self.style_btns = self.tile_grid(items, 3, self.set_style)
+        sa = QScrollArea()
+        sa.setWidgetResizable(True)
+        sa.setWidget(w)
+        sa.setFrameShape(QFrame.NoFrame)
+        v.addWidget(sa)
+        hl = QLabel("A style sets the font, colours and effect in one click. Fine-tune it in the other tabs.")
+        hl.setWordWrap(True)
+        v.addWidget(hl)
+        self.tabs.addTab(page, "Advanced")
+
+    @staticmethod
+    def look(it):
+        return {"font": it.font().toString(), "color": it.defaultTextColor().name(QColor.HexArgb), "fx": it.fx,
+                "fxc": it.fx_color.name(QColor.HexArgb), "amt": it.fx_amt}
+
+    @staticmethod
+    def apply_look(it, L):
+        f = QFont()
+        f.fromString(L["font"])
+        it.setFont(f)
+        it.setDefaultTextColor(QColor(L["color"]))
+        it.fx, it.fx_color, it.fx_amt = L["fx"], QColor(L["fxc"]), L["amt"]
+
+    def toggle_fx(self, on):
+        if self.busy:
+            return
+        its = self.texts()
+        for it in its:
+            it.fx_on = bool(on)
+            self.m.relayout(it)
+        self.m.scene.update()
+        if its:
+            self.m.commit()
+        self.refresh()
+
+    def toggle_curve(self, on):
+        if self.busy:
+            return
+        its = self.texts()
+        for it in its:
+            it.curve_on = bool(on)
+            self.m.relayout(it)
+        self.m.scene.update()
+        if its:
+            self.m.commit()
+        self.refresh()
+
+    def toggle_adv(self, on):
+        if self.busy:
+            return
+        its = [i for i in self.texts() if i.adv]
+        for it in its:
+            if on and not it.adv["on"]:
+                it.adv["before"] = self.look(it)           # keep anything changed while the style was off
+                self.apply_look(it, it.adv["after"])
+            elif not on and it.adv["on"]:
+                it.adv["after"] = self.look(it)            # remember the style as it is now
+                self.apply_look(it, it.adv["before"])
+            it.adv["on"] = bool(on)
+            self.m.relayout(it)
+        self.m.scene.update()
+        if its:
+            self.m.commit()
+        self.refresh()
+
+    def set_effect(self, key):
+        its = self.texts()
+        for it in its:
+            it.fx_on = True
+            if key != "none" and it.fx == "none" and it.fx_color == QColor("#7b5cff"):
+                c = it.defaultTextColor()
+                if key in ("glow", "neon", "background", "drop", "echo") and c.lightness() < 120:
+                    it.fx_color = QColor("#8f6bff")
+            it.fx = key
+            self.m.relayout(it)
+        self.m.scene.update()
+        if its:
+            self.m.commit()
+        self.refresh()
+
+    def set_shape(self, key):
+        v = 0 if key == "none" else (self.curve_s.value() or 50)
+        its = self.texts()
+        for it in its:
+            it.curve_on = True
+        if self.curve_s.value() == v:
+            self.put("curve", v, True)
+        else:
+            self.curve_s.setValue(v)
+            if its:
+                self.m.commit()
+        self.mark_shape()
+        self.refresh()
+
+    def mark_shape(self):
+        self.shape_btns["none"].setChecked(self.curve_s.value() == 0)
+        self.shape_btns["curve"].setChecked(self.curve_s.value() != 0)
+
+    def pick_fx_color(self):
+        its = self.texts()
+        if not its:
+            return
+        c = QColorDialog.getColor(its[0].fx_color, self, "Effect color", QColorDialog.ShowAlphaChannel)
+        if not c.isValid():
+            return
+        for it in its:
+            it.fx_color = c
+            it.fx_on = True
+            if it.fx == "none":
+                it.fx = "drop"
+            self.m.relayout(it)
+        self.m.scene.update()
+        self.m.commit()
+        self.refresh()
+
+    def set_style(self, name):
+        spec = next((t for t in TEXT_STYLES if t[0] == name), None)
+        its = self.texts()
+        if not spec or not its:
+            return
+        _, fams, bold, fx, col, fxc, amt = spec
+        fam = self.style_font(fams)
+        for it in its:
+            before = it.adv["before"] if (it.adv and it.adv["on"]) else self.look(it)
+            it.fx_on = True
+            f = it.font()
+            if fam:
+                f.setFamily(fam)
+            f.setBold(bold)
+            it.setFont(f)
+            it.setDefaultTextColor(QColor(col))
+            it.fx, it.fx_color, it.fx_amt = fx, QColor(fxc), amt
+            it.adv = {"name": name, "on": True, "before": before, "after": self.look(it)}
+            self.m.relayout(it)
+        self.m.scene.update()
+        self.m.commit()
         self.refresh()
 
     def texts(self):
@@ -3337,6 +4293,8 @@ class TextPanel(QDialog):
         its = self.texts()
         for it in its:
             setattr(it, attr, v)
+            if attr == "curve":
+                it.curve_on = True
             self.m.relayout(it)
         self.m.scene.update()
         if its and final:
@@ -3382,6 +4340,147 @@ class TextPanel(QDialog):
                 w.blockSignals(False)
         self.ind_lbl.setText(f"Indent level: {it.indent}")
         self.ocolor.setText(f"Outline Color...  ({it.outline.name()})")
+        for (s2, sp2), v2 in ((self.fx_amt, it.fx_amt), (self.fx_ang, it.fx_ang), ((self.curve_s, self.curve_sp), it.curve)):
+            for w in (s2, sp2):
+                w.blockSignals(True)
+                w.setValue(int(v2))
+                w.blockSignals(False)
+        for key, b in self.fx_btns.items():
+            b.setChecked(key == it.fx and it.fx_on)
+        self.mark_shape()
+        self.cv_chk.setChecked(it.curve_on)
+        self.cv_box.setEnabled(it.curve_on)
+        self.fx_chk.setChecked(it.fx_on)
+        self.fx_box.setEnabled(it.fx_on)
+        self.shape_btns["none"].setChecked(it.curve_eff() == 0)
+        self.shape_btns["curve"].setChecked(it.curve_eff() != 0)
+        self.adv_chk.setEnabled(bool(it.adv))
+        self.adv_chk.setChecked(bool(it.adv and it.adv["on"]))
+        for name, b in self.style_btns.items():
+            b.setChecked(bool(it.adv and it.adv["on"] and it.adv["name"] == name))
+        self.fxcol.setText(f"Effect Color...  ({it.fx_color.name()})")
+        self.busy = False
+
+
+class BrushPanel(QDialog):
+    """Arrow brushes: style tiles, colour, thickness, head size. While 'Draw' is on, dragging on the canvas draws an arrow;
+    when an arrow is selected, the choices also change that arrow."""
+    def __init__(self, m):
+        super().__init__(m)
+        self.m, self.busy, self.last = m, False, None
+        self.setWindowTitle("Arrow Brushes")
+        self.setFixedWidth(400)
+        self.resize(400, 640)
+        lay = QVBoxLayout(self)
+        self.draw = QPushButton("Draw arrows on the canvas")
+        self.draw.setCheckable(True)
+        self.draw.setObjectName("primary")
+        self.draw.toggled.connect(self.set_drawing)
+        lay.addWidget(self.draw)
+        self.hint = QLabel("Drag on the canvas to draw. Hold Shift (or tick Straight) for a straight arrow. "
+                           "Turn Draw off to select and move arrows.")
+        self.hint.setWordWrap(True)
+        lay.addWidget(self.hint)
+        items = []
+        for name, key in ARROW_STYLES:
+            pm = QPixmap(180, 180)
+            pm.setDevicePixelRatio(2)
+            pm.fill(QColor("#ffffff"))
+            q = QPainter(pm)
+            q.setRenderHint(QPainter.Antialiasing)
+            it = ArrowItem([QPointF(10, 62), QPointF(30, 28), QPointF(55, 18), QPointF(72, 36)], key, "#7b3ff2", 5.0, 70)
+            q.translate(2, 4)
+            it.paint(q, None)
+            q.end()
+            items.append((name, pm, key))
+        tp = TextPanel.tile_grid(self, items, 3, self.pick_style, 72)
+        self.tiles = tp[1]
+        sa = QScrollArea()
+        sa.setWidgetResizable(True)
+        sa.setWidget(tp[0])
+        sa.setFrameShape(QFrame.NoFrame)
+        sa.setMinimumHeight(250)
+        lay.addWidget(sa, 1)
+        self.col = QPushButton("Color...")
+        self.col.clicked.connect(self.pick_color)
+        lay.addWidget(self.col)
+        self.wd = slider_spin(lay, "Thickness (px)", 2, 80, lambda v, d: self.put("width", v, d), m.commit)
+        self.hd = slider_spin(lay, "Arrow head size (%)", 40, 300, lambda v, d: self.put("head", v, d), m.commit)
+        self.straight = QCheckBox("Straight arrows (drag from start to end)")
+        self.straight.toggled.connect(lambda v: self.m.brush_cfg.__setitem__("straight", bool(v)))
+        lay.addWidget(self.straight)
+        m.scene.selectionChanged.connect(self.refresh)
+        self.refresh()
+
+    def arrows(self):
+        return [i for i in self.m.layers_sel() if isinstance(i, ArrowItem) and not i.data(1)]
+
+    def set_drawing(self, on):
+        sc = self.m.scene
+        self.draw.blockSignals(True)
+        self.draw.setChecked(bool(on))
+        self.draw.blockSignals(False)
+        sc.brush = self.m.brush_cfg if on else None
+        for v in self.m.view, self.m.view.viewport():
+            v.setCursor(Qt.CrossCursor if on else Qt.ArrowCursor)
+
+    def closeEvent(self, e):
+        self.set_drawing(False)
+        super().closeEvent(e)
+
+    def hideEvent(self, e):
+        self.set_drawing(False)
+        super().hideEvent(e)
+
+    def pick_style(self, key):
+        self.m.brush_cfg["style"] = key
+        its = self.arrows()
+        for it in its:
+            it.style = key
+            it.recalc()
+            it.update()
+        if its:
+            self.m.commit()
+        self.refresh()
+
+    def pick_color(self):
+        c = QColorDialog.getColor(QColor(self.m.brush_cfg["color"]), self, "Arrow color", QColorDialog.ShowAlphaChannel)
+        if not c.isValid():
+            return
+        self.m.brush_cfg["color"] = c.name(QColor.HexArgb)
+        its = self.arrows()
+        for it in its:
+            it.fill = QColor(c)
+            it.update()
+        if its:
+            self.m.commit()
+        self.refresh()
+
+    def put(self, attr, v, final):
+        if self.busy:
+            return
+        self.m.brush_cfg[attr] = v
+        its = self.arrows()
+        for it in its:
+            setattr(it, "lw" if attr == "width" else attr, float(v))
+            it.recalc()
+            it.update()
+        self.m.scene.update()
+        if its and final:
+            self.m.commit()
+
+    def refresh(self):
+        cfg_, its = self.m.brush_cfg, self.arrows()
+        if its:                                   # an arrow is selected: show ITS settings
+            a = its[0]
+            cfg_.update(style=a.style, color=a.fill.name(QColor.HexArgb), width=a.lw, head=a.head)
+        self.busy = True
+        for key, b in self.tiles.items():
+            b.setChecked(key == cfg_["style"])
+        self.wd[2](int(cfg_["width"]))
+        self.hd[2](int(cfg_["head"]))
+        self.straight.setChecked(bool(cfg_["straight"]))
+        self.col.setText(f"Color...  ({cfg_['color'][-6:]})")
         self.busy = False
 
 
@@ -5316,6 +6415,9 @@ def draw_ui_icon(p, name, color, S):
     elif name == "shape":
         p.drawRoundedRect(R(3.5, 10.5, 10, 10), 2 * u, 2 * u)
         p.drawEllipse(P(15, 9), 5.2 * u, 5.2 * u)
+    elif name == "brush":
+        PL((4.5, 17.5), (8, 10), (13, 8), (19, 6))
+        PL((13.5, 4.5), (19.5, 5.8), (17.5, 11.5))
     elif name == "grid":
         for x, y, w, h in ((4, 4, 7, 9), (13, 4, 7, 5), (13, 11, 7, 9), (4, 15, 7, 5)):
             p.drawRoundedRect(R(x, y, w, h), 1.8 * u, 1.8 * u)
@@ -6964,6 +8066,9 @@ class Main(QMainWindow):
         self.view.on_key = self.crop_key
         self.view.on_context = self.canvas_menu
         self.scene.on_shape_edit = self.shape_panel
+        self.scene.on_arrow_edit = self.brush_panel
+        self.scene.on_brush_done = self.brush_done
+        self.brush_cfg = {"style": "classic", "color": "#ff4d6d", "width": 14, "head": 100, "straight": False}
         self._build_menus()
         self._build_toolbar()
         self._build_float_bar()
@@ -7051,6 +8156,7 @@ class Main(QMainWindow):
         self._act(m, "Rectangle", lambda: self.add_shape("rect"))
         self._act(m, "Ellipse", lambda: self.add_shape("ellipse"))
         self._act(m, "Line", lambda: self.add_shape("line"))
+        self._act(m, "Arrow Brushes...", self.brush_panel)
         self._act(m, "Edit Shape... (opacity, corners, shadow, border)", self.shape_panel)
         self._act(m, "Grid Layouts...", self.add_grid)
         self._act(m, "Grid (plain 2 x 2)", self.add_grid_simple)
@@ -7175,6 +8281,7 @@ class Main(QMainWindow):
         self._icon_for(shapes, "shape")
         rail.addAction(shapes)
         rail.widgetForAction(shapes).setPopupMode(QToolButton.InstantPopup)
+        self._tool(rail, "Brushes", "brush", self.brush_panel, "Draw arrows with arrow brushes")
         self._tool(rail, "Grids", "grid", self.add_grid, "Photo grid layouts")
         self._tool(rail, "Templates", "template", self.templates, "Ready-made carousel templates")
         rail.addSeparator()
@@ -7668,11 +8775,16 @@ class Main(QMainWindow):
             d.update(type="text", text=it.toPlainText(), font=it.font().toString(),
                      color=it.defaultTextColor().name(QColor.HexArgb), align=it.align, box_w=it.box_w,
                      line_h=it.line_h, indent=it.indent, outline_w=it.outline_w,
-                     outline=it.outline.name(QColor.HexArgb))
+                     outline=it.outline.name(QColor.HexArgb), tfx=it.fx, tfx_color=it.fx_color.name(QColor.HexArgb),
+                     tfx_amt=it.fx_amt, tfx_ang=it.fx_ang, curve=it.curve,
+                     fx_on=it.fx_on, curve_on=it.curve_on, adv=it.adv)
         elif isinstance(it, GridItem):
             d.update(type="grid", rows=it.rows, cols=it.cols, w=it.w, h=it.h, gap=it.gap, radius=it.radius,
                      fill=it.fill.name(QColor.HexArgb), ids=list(it.ids), cells=it.cells,
                      adjs=[a or {} for a in it.adjs], crops=list(it.crops), fills=list(it.fills))
+        elif isinstance(it, ArrowItem):
+            d.update(type="arrow", pts=[[round(q.x(), 2), round(q.y(), 2)] for q in it.pts], style=it.style,
+                     color=it.fill.name(QColor.HexArgb), width=it.lw, head=it.head, shadow=it.shadow)
         elif isinstance(it, ShapeItem):
             d.update(type="shape", kind=it.kind, w=it.w, h=it.h, bw=it.bw,
                      fill=it.fill.name(QColor.HexArgb), border=it.border.name(QColor.HexArgb),
@@ -7704,6 +8816,9 @@ class Main(QMainWindow):
             it.align, it.box_w = d.get("align", "left"), d.get("box_w", 0)
             it.line_h, it.indent, it.outline_w = d.get("line_h", 100), d.get("indent", 0), d.get("outline_w", 0)
             it.outline = QColor(d.get("outline", "#000000"))
+            it.fx, it.fx_color = d.get("tfx", "none"), QColor(d.get("tfx_color", "#7b5cff"))
+            it.fx_amt, it.fx_ang, it.curve = d.get("tfx_amt", 50), d.get("tfx_ang", 45), d.get("curve", 0)
+            it.fx_on, it.curve_on, it.adv = d.get("fx_on", True), d.get("curve_on", True), d.get("adv")
             it.apply_layout()
         elif t == "grid":
             ids = d.get("ids") or []
@@ -7719,6 +8834,10 @@ class Main(QMainWindow):
                 for k in range(it.count()):
                     if it.ids[k] and (it.adjs[k] or it.crops[k]):
                         it.pms[k] = self.cell_pixmap(it, k)
+        elif t == "arrow":
+            it = ArrowItem([QPointF(a, b) for a, b in d["pts"]], d.get("style", "classic"), d.get("color", "#ff4d6d"),
+                           d.get("width", 10), d.get("head", 100))
+            it.set_shadow(d.get("shadow", False))
         elif t == "shape":
             it = ShapeItem(d["kind"], d["w"], d["h"], d["fill"], d["border"], d["bw"])
             it.radius, it.corners = d.get("radius", 0), list(d.get("corners", [True] * 4))
@@ -8737,7 +9856,7 @@ class Main(QMainWindow):
         if isinstance(it, TextItem):
             return it.toPlainText().strip().replace("\n", " ")[:32] or "Text"
         if isinstance(it, ShapeItem):
-            return {"rect": "Rectangle", "ellipse": "Ellipse", "line": "Line"}[it.kind]
+            return {"rect": "Rectangle", "ellipse": "Ellipse", "line": "Line", "arrow": "Arrow"}[it.kind]
         if isinstance(it, GridItem):
             return f"Grid ({it.count()} cells)" if it.cells else f"Grid {it.rows}x{it.cols}"
         if HAS_VIDEO and isinstance(it, VideoItem):
@@ -9158,7 +10277,35 @@ class Main(QMainWindow):
         self.scene.update()
         self.sync_controls(False)
 
+    def brush_panel(self):
+        """Arrow brushes: pick a style, then drag on the canvas to draw. Also edits the selected arrow."""
+        if not hasattr(self, "brs_panel"):
+            self.brs_panel = BrushPanel(self)
+        self.brs_panel.refresh()
+        self.brs_panel.show()
+        self.brs_panel.raise_()
+        self.brs_panel.set_drawing(True)
+
+    def brush_done(self, pts):
+        """A new arrow was drawn: pts in scene coordinates."""
+        cfg_ = self.brush_cfg
+        xs, ys = [q.x() for q in pts], [q.y() for q in pts]
+        org = QPointF(min(xs), min(ys))
+        it = ArrowItem([q - org for q in pts], cfg_["style"], cfg_["color"], cfg_["width"], cfg_["head"])
+        it.setFlags(QGraphicsPixmapItem.ItemIsMovable | QGraphicsPixmapItem.ItemIsSelectable)
+        it.setTransformOriginPoint(it.boundingRect().center())
+        it.setPos(org)
+        it.setZValue(max([i.zValue() for i in self.scene.items() if i is not self.scene.brush_prev] + [0]) + 1)
+        self.scene.addItem(it)
+        self.commit()
+        self.scene.clearSelection()
+        if getattr(self, "brs_panel", None):
+            self.brs_panel.last = it
+
     def shape_panel(self):
+        if isinstance(self.selected(), ArrowItem):
+            self.brush_panel()
+            return
         if not hasattr(self, "shp_panel"):
             self.shp_panel = ShapePanel(self)
         self.shp_panel.refresh()

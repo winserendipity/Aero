@@ -181,11 +181,20 @@ More than **230 looks**, searchable and grouped by category:
 - **Alignment:** Left, Center, Right, Justify.
 - **Line spacing, indent and outline** controls.
 - **Text box modes:** Auto Width or Manual Width.
+- **Effects** (Text menu > Text Options > *Effects* tab): Drop, Glow, Echo, Outline, Background, Splice, Hollow, Neon and Glitch, each with its own colour, intensity and direction.
+- **Shape** tab: bend text with a **Curve** slider (-100 to 100; positive arches the text, negative makes a bowl, 100 closes a full circle).
+- **Advanced** tab: ready-made looks (Neon Lights, TV Static, 70s, Sci-fi, Screenprint, Western, Graffiti, Bubble, Aerobics, Arcade, Cosmic, Pixel) that set font, colours and effect in one click. Effects and curves are drawn as sharp outlines, so they stay crisp at any export size. Letters keep their exact shape when curved. Each tab has an **on / off** switch per text, so you can compare with the plain text and switch back without redoing anything.
 
 ### Shapes
 
 - **Rectangle, Ellipse and Line.**
 - Fill colour, border colour and width, **opacity**, **corner rounding** and **drop shadow**.
+
+### Arrow brushes
+
+- **Insert > Arrow Brushes...** (or **Brushes** in the tool rail) opens a panel of 12 arrow styles: Classic, Solid head, Sketch, Brush, Dashed, Dotted, Double, Block, Outline, Chalk, Wavy and Dot start.
+- Turn **Draw** on and drag on the canvas: the arrow follows your mouse and is smoothed automatically. Hold **Shift** (or tick *Straight arrows*) for a straight arrow.
+- Colour, thickness and arrow-head size can be changed any time, also for an arrow you already drew (select it, or double-click it). Arrows are normal layers: move, rotate, scale, lock, hide, shadow and opacity all work, and they export crisp at any resolution.
 
 ### Collage grids
 

@@ -370,4 +370,4 @@ Aero is at **version 1.0.0**. Current focus:
 
 Created by **Winserendipity**.
 
-© 2026 Winserendipity. **All rights reserved.** Aero is distributed as a compiled Windows application. The source code is open; to collaborate with others, please ask the author's permission.
+© 2026 Winserendipity. **All rights reserved.** Aero is distributed as a compiled Windows application. Any source code in this repository is provided for viewing only and may not be copied, redistributed or modified without the author's permission. See [LICENSE](LICENSE). Aero is built with open-source components, listed with their licenses in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

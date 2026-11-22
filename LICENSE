@@ -1,0 +1,18 @@
+Aero - Copyright (c) 2026 Winserendipity. All Rights Reserved.
+
+The Aero application and any source code in this repository are provided
+for viewing, and for personal use of the released Windows installer only.
+
+You may NOT copy, modify, merge, publish, distribute, sublicense, sell, or
+create derivative works of this software or any part of it, in source or
+binary form, without prior written permission from the copyright holder.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHOR BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY ARISING FROM THE
+USE OF THE SOFTWARE.
+
+Third-party components that Aero uses or ships with are provided under their
+own licenses. They are listed in THIRD_PARTY_NOTICES.md and are not covered by
+the terms above.
